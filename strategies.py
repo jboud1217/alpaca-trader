@@ -80,7 +80,12 @@ class Strategy:
         credit = position.credit_received
         if credit > 0 and profit_take is not None and pnl >= profit_take * credit:
             return f"profit_target {int(profit_take * 100)}%"
-        if credit > 0 and pnl <= -stop_mult * credit:
+        # `stop_mult is None` means no stop -- ride the position to expiry. That
+        # is a legitimate configuration (it is what the CBOE PUT index does, and
+        # what you must run to compare against it), and it used to raise
+        # TypeError here because only profit_take was guarded. See
+        # test_bug_no_stop_mult_crashes.
+        if credit > 0 and stop_mult is not None and pnl <= -stop_mult * credit:
             return f"stop {stop_mult}x"
         return None
 

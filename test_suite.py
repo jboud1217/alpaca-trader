@@ -650,5 +650,46 @@ class TestNoArbitrageBound(unittest.TestCase):
                 t.pnl, -(ml + fees) - 0.01,
                 f"loss ${t.pnl:.2f} exceeds structural max ${ml:.2f} + fees")
 
+
+class TestNoStopConfig(unittest.TestCase):
+    """`stop_mult=None` means hold to expiry with no stop. It is the config you
+    need to compare against the CBOE PUT index, and it used to raise."""
+
+    def _chain(self, spot=100.0, as_of=None, expiry=None):
+        from data import OptionChain, OptionQuote
+        as_of = as_of or date(2025, 6, 2)
+        expiry = expiry or date(2025, 7, 2)
+        # Distinct deltas, and strikes below the 30-delta one, or the wing has
+        # nowhere to go and propose_entry correctly returns None.
+        qs = []
+        for k, d, px in ((80.0, -0.05, 0.15), (85.0, -0.12, 0.40),
+                         (90.0, -0.30, 1.10), (95.0, -0.50, 2.60)):
+            qs.append(OptionQuote(right="put", strike=k, expiry=expiry,
+                                  bid=px, ask=px * 1.2, delta=d, iv=0.20))
+        return OptionChain(as_of, "TEST", spot, qs)
+
+    def test_bug_no_stop_mult_crashes(self):
+        """stop_mult=None raised TypeError on -stop_mult; profit_take was
+        guarded and stop_mult was not."""
+        from strategies import PutCreditSpread
+        s = PutCreditSpread(short_delta=0.30, wing_width=5, target_dte=30,
+                            profit_take=None, stop_mult=None, min_dte=0)
+        chain = self._chain()
+        pos = s.propose_entry(chain, 0)
+        self.assertIsNotNone(pos, "fixture should produce a position")
+        try:
+            s.manage(pos, chain)          # must not raise
+        except TypeError as e:
+            self.fail(f"stop_mult=None must mean 'no stop', not crash: {e}")
+
+    def test_no_stop_still_honours_profit_take(self):
+        """Disabling the stop must not disable the profit target."""
+        from strategies import PutCreditSpread
+        s = PutCreditSpread(short_delta=0.30, wing_width=5, target_dte=30,
+                            profit_take=0.50, stop_mult=None, min_dte=0)
+        pos = s.propose_entry(self._chain(), 0)
+        self.assertIsNotNone(pos)
+        s.manage(pos, self._chain())      # exercises both branches, no raise
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
