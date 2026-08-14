@@ -161,6 +161,39 @@ class SpreadModel:
     _ES_SPY_MEASURED = ((0.000, 0.008), (0.005, 0.028),
                         (0.020, 0.133), (0.050, 0.222))
 
+    # Per-symbol surfaces, measured 2026-08-14 14:32 ET on live chains.
+    # Liquidity is NOT a property of "index ETF options" in general -- it is a
+    # property of each name, and the differences are large enough to change
+    # which symbols are worth trading at all.
+    #
+    # IWM is 2-4x worse than SPY everywhere: 3.7% vs 1.0% at the money, 6.7%
+    # vs 2.3% just OTM. The cause is structural rather than incidental -- IWM
+    # trades near $304 against SPY's $776, so an identically wide nickel market
+    # is more than twice the percentage bite. Any low-priced underlying
+    # inherits this, which is why cheap tickers make poor premium-selling
+    # vehicles regardless of how liquid their SHARES are.
+    _SURFACES = {
+        "SPY": ((7,   ((0.000, 0.010), (0.005, 0.023), (0.020, 0.133), (0.050, 0.222))),
+                (21,  ((0.000, 0.012), (0.005, 0.016), (0.020, 0.022), (0.050, 0.061))),
+                (999, ((0.000, 0.011), (0.005, 0.012), (0.020, 0.009), (0.050, 0.010)))),
+        "QQQ": ((7,   ((0.000, 0.012), (0.005, 0.020), (0.020, 0.049), (0.050, 0.200))),
+                (21,  ((0.000, 0.011), (0.005, 0.014), (0.020, 0.019), (0.050, 0.038))),
+                (999, ((0.000, 0.006), (0.005, 0.007), (0.020, 0.012), (0.050, 0.012)))),
+        "IWM": ((7,   ((0.000, 0.037), (0.005, 0.067), (0.020, 0.118), (0.050, 0.286))),
+                (21,  ((0.000, 0.026), (0.005, 0.032), (0.020, 0.066), (0.050, 0.133))),
+                (999, ((0.000, 0.017), (0.005, 0.017), (0.020, 0.019), (0.050, 0.036)))),
+    }
+
+    @classmethod
+    def for_symbol(cls, symbol: str) -> "SpreadModel":
+        """Measured surface for `symbol`, falling back to SPY's for anything
+        unmeasured -- which is OPTIMISTIC, since SPY is the most liquid options
+        market in existence. Measure before trusting a result on a new name."""
+        m = cls(min_half=0.005, pct_of_price=0.005,
+                use_moneyness=True, use_surface=True)
+        m._ES_SURFACE = cls._SURFACES.get(symbol.upper(), cls._SURFACES["SPY"])
+        return m
+
     @classmethod
     def spy_measured(cls) -> "SpreadModel":
         """SPY's real quoted spread across moneyness AND tenor. This is the
