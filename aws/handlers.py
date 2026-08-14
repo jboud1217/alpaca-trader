@@ -372,7 +372,8 @@ def scan(event, context):
         try:
             trade = ex.size_trade(token, sym, rec["chain"], rec["short_q"],
                                   rec["long_q"], limits,
-                                  open_risk=executor.open_risk())
+                                  open_risk=executor.open_risk(),
+                                  open_risk_this_underlying=executor.open_risk(sym))
         except ex.RiskRefusal as e:
             results[sym] = f"not sized: {e}"
             ex.record_refusal(token, str(e))

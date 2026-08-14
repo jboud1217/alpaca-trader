@@ -96,7 +96,8 @@ def scan_and_propose(symbols, clients, cal, limits, notifier, executor,
             token = nt.new_token()
         try:
             trade = ex.size_trade(token, sym, chain, short_q, long_q, limits,
-                                  open_risk=executor.open_risk())
+                                  open_risk=executor.open_risk(),
+                                  open_risk_this_underlying=executor.open_risk(sym))
         except ex.RiskRefusal as e:
             print(f"[{sym}] not sized: {e}")
             ex.record_refusal(token, str(e))

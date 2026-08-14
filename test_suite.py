@@ -691,5 +691,110 @@ class TestNoStopConfig(unittest.TestCase):
         self.assertIsNotNone(pos)
         s.manage(pos, self._chain())      # exercises both branches, no raise
 
+
+class TestConcentrationCap(unittest.TestCase):
+    """The portfolio cap alone permits full concentration in one name. The dev
+    book held IWM 302/299p AND 303/300p simultaneously -- adjacent strikes, same
+    expiry, same underlying. One gap takes both to max loss."""
+
+    def _quotes(self):
+        from data import OptionQuote
+        exp = date(2026, 9, 18)
+        short = OptionQuote(right="put", strike=300.0, expiry=exp, bid=1.00,
+                            ask=1.10, delta=-0.30, iv=0.22, symbol="IWM260918P00300000")
+        long = OptionQuote(right="put", strike=297.0, expiry=exp, bid=0.40,
+                           ask=0.48, delta=-0.18, iv=0.24, symbol="IWM260918P00297000")
+        return short, long
+
+    def _limits(self, **kw):
+        from execution import RiskLimits
+        base = dict(account_equity=25_000.0, risk_per_trade_frac=0.05,
+                    max_contracts=5, max_risk_per_trade=2_000.0,
+                    max_open_risk=1_500.0, min_credit_per_contract=20.0,
+                    max_spread_frac_of_credit=0.90)
+        base.update(kw)
+        return RiskLimits(**base)
+
+    def test_bug_portfolio_cap_allows_full_concentration(self):
+        """With 50% per-name cap, a third IWM spread must be refused once
+        $750 of IWM risk is already open -- even though the $1,500 PORTFOLIO
+        cap still shows $750 of room."""
+        from execution import size_trade, RiskRefusal
+        short, long = self._quotes()
+        with self.assertRaises(RiskRefusal) as ctx:
+            size_trade("TOKEN", "IWM", None, short, long,
+                       self._limits(max_open_risk_per_underlying_frac=0.50),
+                       open_risk=750.0, open_risk_this_underlying=750.0)
+        self.assertIn("concentration", str(ctx.exception).lower())
+
+    def test_other_underlying_still_allowed(self):
+        """The cap is PER NAME: SPY must still size with $750 of IWM open."""
+        from execution import size_trade
+        short, long = self._quotes()
+        t = size_trade("TOKEN", "SPY", None, short, long,
+                       self._limits(max_open_risk_per_underlying_frac=0.50),
+                       open_risk=750.0, open_risk_this_underlying=0.0)
+        self.assertGreaterEqual(t.contracts, 1)
+
+    def test_cap_defaults_are_backward_compatible(self):
+        """Callers that do not pass open_risk_this_underlying must behave as
+        before -- the new arg defaults to 0."""
+        from execution import size_trade
+        short, long = self._quotes()
+        t = size_trade("TOKEN", "IWM", None, short, long,
+                       self._limits(), open_risk=0.0)
+        self.assertGreaterEqual(t.contracts, 1)
+
+
+class TestOpenRiskDetection(unittest.TestCase):
+    """open_risk() returned 0.0 for a book full of options, so max_open_risk
+    never fired. Cause: alpaca-py's AssetClass enum stringifies as
+    "AssetClass.US_OPTION" -- uppercase -- and the test was a case-sensitive
+    `"option" in str(...)`."""
+
+    class _AssetClass:
+        """Mimics alpaca-py's enum: uppercase str(), lowercase .value."""
+        value = "us_option"
+        def __str__(self):
+            return "AssetClass.US_OPTION"
+
+    def _pos(self, symbol, qty):
+        return SimpleNamespace(symbol=symbol, qty=str(qty),
+                               asset_class=self._AssetClass())
+
+    def _executor(self, positions):
+        trading = SimpleNamespace(get_all_positions=lambda: positions)
+        return ex.Executor(trading, None, ex.RiskLimits())
+
+    def test_bug_open_risk_blind_to_uppercase_asset_class(self):
+        """Three short contracts must not read as zero risk."""
+        e = self._executor([self._pos("IWM260817P00302000", -1),
+                            self._pos("IWM260817P00303000", -1),
+                            self._pos("SPY260817P00775000", -1)])
+        self.assertGreater(e.open_risk(), 0.0,
+                           "short options must register as open risk")
+
+    def test_open_risk_filters_by_underlying(self):
+        e = self._executor([self._pos("IWM260817P00302000", -1),
+                            self._pos("IWM260817P00303000", -1),
+                            self._pos("SPY260817P00775000", -1)])
+        self.assertAlmostEqual(e.open_risk("IWM"), 2 * e.open_risk("SPY"))
+        self.assertAlmostEqual(e.open_risk("IWM") + e.open_risk("SPY"),
+                               e.open_risk())
+        self.assertEqual(e.open_risk("QQQ"), 0.0)
+
+    def test_long_legs_do_not_add_risk(self):
+        """Only SHORT options carry the defined-risk exposure."""
+        e = self._executor([self._pos("IWM260817P00299000", 1),
+                            self._pos("IWM260817P00300000", 1)])
+        self.assertEqual(e.open_risk(), 0.0)
+
+    def test_unreachable_broker_reports_infinite_risk(self):
+        """If exposure cannot be verified, behave as if fully allocated."""
+        def boom():
+            raise RuntimeError("broker down")
+        e = ex.Executor(SimpleNamespace(get_all_positions=boom), None, ex.RiskLimits())
+        self.assertEqual(e.open_risk(), float("inf"))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

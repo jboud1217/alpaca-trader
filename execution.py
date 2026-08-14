@@ -57,6 +57,17 @@ class RiskLimits:
     max_contracts: int = 2                 # absolute ceiling per order
     max_risk_per_trade: float = 750.0      # dollars, absolute ceiling
     max_open_risk: float = 2_500.0         # total defined risk across open positions
+    # Per-underlying ceiling, as a fraction of max_open_risk. Without this the
+    # portfolio cap gives an ILLUSION of diversification: it was satisfied while
+    # the book held two IWM spreads at 302/299 and 303/300 -- adjacent strikes,
+    # same name, same expiry. Those are not two positions. One gap below 299
+    # takes both to max loss simultaneously.
+    #
+    # It matters more here than it looks, because the three symbols traded are
+    # SPY/QQQ/IWM at pairwise correlation ~0.87 -- about 1.1 independent assets
+    # even when fully spread out. Concentrating inside one name throws away the
+    # little diversification that exists.
+    max_open_risk_per_underlying_frac: float = 0.50
     max_orders_per_day: int = 3
     max_new_risk_per_day: float = 1_500.0
     min_credit_per_contract: float = 20.0  # below this, fees and spread dominate
@@ -113,7 +124,8 @@ def occ_symbol(underlying: str, expiry: date, right: str, strike: float) -> str:
 
 
 def size_trade(token: str, underlying: str, chain, short_q, long_q,
-               limits: RiskLimits, open_risk: float = 0.0) -> SizedTrade:
+               limits: RiskLimits, open_risk: float = 0.0,
+               open_risk_this_underlying: float = 0.0) -> SizedTrade:
     """Turn a chain proposal into a contract count, or refuse.
 
     Sizes off DEFINED RISK, not notional and not buying power. For a credit
@@ -168,6 +180,22 @@ def size_trade(token: str, underlying: str, chain, short_q, long_q,
                 f"${limits.max_open_risk:.0f} ceiling, no room for this trade")
         total_risk = contracts * max_loss
         note += f"; reduced to fit ${limits.max_open_risk:.0f} portfolio cap"
+
+    # Per-underlying cap, applied AFTER the portfolio cap so the tighter of the
+    # two always wins.
+    per_name_cap = limits.max_open_risk * limits.max_open_risk_per_underlying_frac
+    if open_risk_this_underlying + total_risk > per_name_cap:
+        room = per_name_cap - open_risk_this_underlying
+        contracts = int(math.floor(room / max_loss))
+        if contracts < 1:
+            raise RiskRefusal(
+                f"{underlying} concentration cap: ${open_risk_this_underlying:.0f} "
+                f"already open in {underlying} against a ${per_name_cap:.0f} "
+                f"per-underlying ceiling "
+                f"({limits.max_open_risk_per_underlying_frac:.0%} of "
+                f"${limits.max_open_risk:.0f}), no room for this trade")
+        total_risk = contracts * max_loss
+        note += f"; reduced to fit ${per_name_cap:.0f} {underlying} cap"
 
     return SizedTrade(
         token=token, symbol=underlying, underlying=underlying,
@@ -276,8 +304,12 @@ class Executor:
                 f"{self.limits.reprice_tolerance_frac:.0%} tolerance")
         return credit_now
 
-    def open_risk(self) -> float:
+    def open_risk(self, underlying: str = None) -> float:
         """Total defined risk across open option positions.
+
+        With `underlying` set, counts only that name -- which is what the
+        per-underlying concentration cap needs. The OCC root is the leading
+        alphabetic run of the contract symbol, so IWM260817P00302000 -> IWM.
 
         Approximates each short option's exposure by its strike notional when it
         cannot pair legs into spreads. That errs HIGH, which for a risk ceiling
@@ -287,9 +319,24 @@ class Executor:
             positions = self.trading.get_all_positions()
         except Exception:
             return float("inf")   # cannot verify exposure => behave as if full
+        want = underlying.upper() if underlying else None
         risk = 0.0
         for p in positions:
-            if getattr(p, "asset_class", None) and "option" in str(p.asset_class):
+            # CASE MATTERS HERE and it silently did not for a long time.
+            # alpaca-py returns the AssetClass enum, whose str() is
+            # "AssetClass.US_OPTION" -- uppercase. The original test was
+            # `"option" in str(p.asset_class)`, which is never true, so this
+            # method returned 0.0 with a book full of options and the
+            # max_open_risk ceiling never once fired. Lowercase both sides, and
+            # check .value too in case the enum's repr changes upstream.
+            ac = f"{getattr(p, 'asset_class', '')}" \
+                 f"{getattr(getattr(p, 'asset_class', None), 'value', '')}".lower()
+            if "option" in ac:
+                if want is not None:
+                    sym = str(getattr(p, "symbol", ""))
+                    root = "".join(c for c in sym[:6] if c.isalpha()).upper()
+                    if root != want:
+                        continue
                 qty = abs(float(p.qty))
                 if float(p.qty) < 0:
                     risk += qty * CONTRACT_MULT * 5.0    # assume 5-wide if unpaired
