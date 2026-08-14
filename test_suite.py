@@ -796,5 +796,103 @@ class TestOpenRiskDetection(unittest.TestCase):
         e = ex.Executor(SimpleNamespace(get_all_positions=boom), None, ex.RiskLimits())
         self.assertEqual(e.open_risk(), float("inf"))
 
+
+class TestOpenRiskPairing(unittest.TestCase):
+    """Legs must pair into spreads. Assuming every short is 5-wide overstated a
+    3-wide book by 67% and would park the system at its ceiling with 40% of the
+    budget genuinely free."""
+
+    class _AC:
+        value = "us_option"
+        def __str__(self):
+            return "AssetClass.US_OPTION"
+
+    def _p(self, sym, qty):
+        return SimpleNamespace(symbol=sym, qty=str(qty), asset_class=self._AC())
+
+    def _e(self, positions):
+        return ex.Executor(SimpleNamespace(get_all_positions=lambda: positions),
+                           None, ex.RiskLimits())
+
+    def test_three_wide_spread_is_three_hundred(self):
+        e = self._e([self._p("SPY260817P00775000", -1),
+                     self._p("SPY260817P00772000", 1)])
+        self.assertAlmostEqual(e.open_risk(), 300.0)
+
+    def test_two_spreads_same_name_sum(self):
+        e = self._e([self._p("IWM260817P00303000", -1),
+                     self._p("IWM260817P00300000", 1),
+                     self._p("IWM260817P00302000", -1),
+                     self._p("IWM260817P00299000", 1)])
+        self.assertAlmostEqual(e.open_risk("IWM"), 600.0)
+
+    def test_naked_short_still_assumed_wide(self):
+        e = self._e([self._p("SPY260817P00775000", -1)])
+        self.assertAlmostEqual(e.open_risk(), 500.0)
+
+    def test_portfolio_equals_sum_of_names(self):
+        e = self._e([self._p("SPY260817P00775000", -1),
+                     self._p("SPY260817P00772000", 1),
+                     self._p("IWM260817P00303000", -1),
+                     self._p("IWM260817P00300000", 1)])
+        self.assertAlmostEqual(e.open_risk(),
+                               e.open_risk("SPY") + e.open_risk("IWM"))
+        self.assertAlmostEqual(e.open_risk(), 600.0)
+
+    def test_different_expiries_do_not_pair(self):
+        e = self._e([self._p("SPY260817P00775000", -1),
+                     self._p("SPY260918P00772000", 1)])
+        self.assertAlmostEqual(e.open_risk(), 500.0)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestOpenRiskPairing(unittest.TestCase):
+    """Legs must pair into spreads. Assuming every short is 5-wide overstated a
+    3-wide book by 67% and would park the system at its ceiling with 40% of the
+    budget genuinely free."""
+
+    class _AC:
+        value = "us_option"
+        def __str__(self): return "AssetClass.US_OPTION"
+
+    def _p(self, sym, qty):
+        return SimpleNamespace(symbol=sym, qty=str(qty), asset_class=self._AC())
+
+    def _e(self, positions):
+        return ex.Executor(SimpleNamespace(get_all_positions=lambda: positions),
+                           None, ex.RiskLimits())
+
+    def test_three_wide_spread_is_three_hundred(self):
+        e = self._e([self._p("SPY260817P00775000", -1),
+                     self._p("SPY260817P00772000", 1)])
+        self.assertAlmostEqual(e.open_risk(), 300.0)
+
+    def test_two_spreads_same_name_sum(self):
+        """IWM 303/300 and 302/299 -> $600, not one spread's worth."""
+        e = self._e([self._p("IWM260817P00303000", -1),
+                     self._p("IWM260817P00300000", 1),
+                     self._p("IWM260817P00302000", -1),
+                     self._p("IWM260817P00299000", 1)])
+        self.assertAlmostEqual(e.open_risk("IWM"), 600.0)
+
+    def test_naked_short_still_assumed_wide(self):
+        """No long to pair with -> fall back to the conservative estimate."""
+        e = self._e([self._p("SPY260817P00775000", -1)])
+        self.assertAlmostEqual(e.open_risk(), 500.0)
+
+    def test_portfolio_equals_sum_of_names(self):
+        e = self._e([self._p("SPY260817P00775000", -1),
+                     self._p("SPY260817P00772000", 1),
+                     self._p("IWM260817P00303000", -1),
+                     self._p("IWM260817P00300000", 1)])
+        self.assertAlmostEqual(e.open_risk(),
+                               e.open_risk("SPY") + e.open_risk("IWM"))
+        self.assertAlmostEqual(e.open_risk(), 600.0)
+
+    def test_different_expiries_do_not_pair(self):
+        """A short and a long in different cycles are not a spread."""
+        e = self._e([self._p("SPY260817P00775000", -1),
+                     self._p("SPY260918P00772000", 1)])
+        self.assertAlmostEqual(e.open_risk(), 500.0)

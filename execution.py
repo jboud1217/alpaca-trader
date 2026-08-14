@@ -116,6 +116,27 @@ class SizedTrade:
 
 
 # --------------------------------------------------------------------------- #
+def _split_occ(symbol: str):
+    """OCC symbol -> (root, expiry, right, strike), or Nones if unparseable.
+
+    Parsed from the RIGHT because the root is variable length:
+    <ROOT><YYMMDD><C|P><strike * 1000, zero-padded to 8>.
+    IWM260817P00302000 -> ("IWM", "260817", "P", 302.0)
+    """
+    try:
+        strike = int(symbol[-8:]) / 1000.0
+        right = symbol[-9].upper()
+        if right not in ("C", "P"):
+            return None, None, None, None
+        expiry = symbol[-15:-9]
+        root = symbol[:-15].upper()
+        if not root or not root.isalpha() or not expiry.isdigit():
+            return None, None, None, None
+        return root, expiry, right, strike
+    except (ValueError, IndexError):
+        return None, None, None, None
+
+
 def occ_symbol(underlying: str, expiry: date, right: str, strike: float) -> str:
     """<ROOT><YYMMDD><C|P><strike*1000 zero-padded to 8>."""
     return (f"{underlying.upper()}{expiry:%y%m%d}"
@@ -320,6 +341,48 @@ class Executor:
         except Exception:
             return float("inf")   # cannot verify exposure => behave as if full
         want = underlying.upper() if underlying else None
+
+        # Pair legs into spreads before pricing the risk. The old fallback --
+        # assume every naked short is 5-wide -- overstated a book of 3-wide
+        # spreads by 67% ($1,500 against a true $900), which would park the
+        # system at its ceiling with 40% of the budget actually free. Erring
+        # high is the right direction for a ceiling, but not so high that the
+        # ceiling stops being usable.
+        #
+        # Legs pair by (root, expiry, right). Each short is matched to the
+        # nearest unused long on the same side; the width between them is the
+        # real exposure. Anything left unmatched is genuinely naked and still
+        # gets the conservative 5-wide assumption.
+        shorts, longs = {}, {}
+        for p in positions:
+            ac = f"{getattr(p, 'asset_class', '')}" \
+                 f"{getattr(getattr(p, 'asset_class', None), 'value', '')}".lower()
+            if "option" not in ac:
+                continue
+            sym = str(getattr(p, "symbol", ""))
+            root, expiry, right, strike = _split_occ(sym)
+            if root is None:
+                continue
+            if want is not None and root != want:
+                continue
+            key = (root, expiry, right)
+            bucket = shorts if float(p.qty) < 0 else longs
+            for _ in range(int(abs(float(p.qty)))):
+                bucket.setdefault(key, []).append(strike)
+
+        risk = 0.0
+        for key, short_strikes in shorts.items():
+            available = sorted(longs.get(key, []))
+            for k in sorted(short_strikes):
+                if available:
+                    # nearest long on the protective side
+                    j = min(range(len(available)), key=lambda i: abs(available[i] - k))
+                    risk += abs(k - available.pop(j)) * CONTRACT_MULT
+                else:
+                    risk += CONTRACT_MULT * 5.0   # naked: assume 5-wide, as before
+        return risk
+
+    def _legacy_open_risk(self, positions, want):
         risk = 0.0
         for p in positions:
             # CASE MATTERS HERE and it silently did not for a long time.
