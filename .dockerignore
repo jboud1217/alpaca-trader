@@ -1,0 +1,11 @@
+.venv/
+.cache/
+__pycache__/
+*.pyc
+.aws-sam/
+*.jsonl
+*.json
+!aws/*.json
+alerts.log
+alerts.err
+KILL_SWITCH

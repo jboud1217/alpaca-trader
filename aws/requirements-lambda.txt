@@ -1,0 +1,3 @@
+# twilio is intentionally absent: the cloud path uses ntfy, and twilio is 50MB.
+alpaca-py>=0.42,<1.0
+requests>=2.31

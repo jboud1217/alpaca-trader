@@ -1,0 +1,4 @@
+# Synthetic (offline) mode needs NOTHING -- pure standard library.
+# These are only for the real-data path: run_backtest.py --real / --calibrate
+alpaca-py>=0.42,<1.0
+twilio>=9.0  # only for alerts.py --sms

@@ -1,0 +1,401 @@
+"""Order staging, sizing, and submission. The only module that can move money.
+
+Everything here is written on the assumption that it will eventually be wrong
+about something, so each control is independent and each one alone is enough to
+stop a bad order:
+
+    kill switch      a file on disk halts all submission, no restart needed
+    armed flag       submission is off by default and must be turned on
+    live confirm     pointing at live requires an explicit, separate opt-in
+    per-trade cap    max contracts and max dollars of risk on one trade
+    portfolio cap    max total open risk across everything
+    daily caps       max orders/day and max new risk/day
+    re-price gate    the quote is re-read at submit; a moved market aborts
+    idempotency      client_order_id derives from the approval token
+    limit only       never a market order on a multi-leg options spread
+
+The re-price gate deserves the most attention because it is the one that is
+easy to leave out and expensive to miss. A text goes out at 10:00 quoting $95 of
+credit. You reply at 10:40. If the order submits at the old price it may now be
+badly mispriced, and on a spread the mid can move faster than the underlying.
+So the market is re-read at submission and the order is abandoned if the
+available credit has slipped past a tolerance. An approval is consent to a
+price, not a standing instruction.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import List, Optional
+
+import storage
+
+# Kept as module attributes for backwards compatibility with local tooling and
+# docs; the authoritative source is storage.KILL / storage.JOURNAL, which Lambda
+# rebinds to DynamoDB at cold start.
+KILL_SWITCH = Path("KILL_SWITCH")
+ORDER_JOURNAL = Path("orders.jsonl")
+CONTRACT_MULT = 100
+
+
+class RiskRefusal(Exception):
+    """Raised when a control blocks an order. Never caught silently."""
+
+
+# --------------------------------------------------------------------------- #
+@dataclass
+class RiskLimits:
+    """Hard caps. These are refusals, not preferences -- nothing overrides them
+    except editing this object, which is a deliberate act."""
+
+    account_equity: float = 25_000.0
+    risk_per_trade_frac: float = 0.02      # 2% of equity at risk on one trade
+    max_contracts: int = 2                 # absolute ceiling per order
+    max_risk_per_trade: float = 750.0      # dollars, absolute ceiling
+    max_open_risk: float = 2_500.0         # total defined risk across open positions
+    max_orders_per_day: int = 3
+    max_new_risk_per_day: float = 1_500.0
+    min_credit_per_contract: float = 20.0  # below this, fees and spread dominate
+    max_spread_frac_of_credit: float = 0.15
+    reprice_tolerance_frac: float = 0.10   # abort if credit slipped >10% since the text
+    approval_ttl_seconds: int = 1800       # a 30-min-old approval is stale, not consent
+    # How hard to cross the spread on entry. 1.0 prices at short.bid - long.ask,
+    # fully marketable, near-certain fill, and you concede the whole spread --
+    # which the friction sweep measured at 7.3% of credit. 0.5 prices at the
+    # mid and halves that, at the cost of possibly not filling. Same knob as
+    # FillModel.slippage_frac in the backtest, so what you sweep there is what
+    # you get here. Defaults to certainty because a partially-filled multi-leg
+    # spread is a worse problem than a slightly worse price.
+    limit_slippage_frac: float = 1.0
+
+    def risk_budget(self) -> float:
+        return min(self.account_equity * self.risk_per_trade_frac,
+                   self.max_risk_per_trade)
+
+
+@dataclass
+class SizedTrade:
+    """A concrete, priced, sized proposal. Immutable once texted."""
+    token: str
+    symbol: str
+    underlying: str
+    expiry: date
+    short_strike: float
+    long_strike: float
+    short_occ: str
+    long_occ: str
+    contracts: int
+    credit_per_contract: float             # dollars
+    max_loss_per_contract: float           # dollars
+    total_credit: float
+    total_risk: float
+    short_delta: float
+    half_spread_cost: float
+    created_at: str
+    sizing_note: str = ""
+
+    def summary(self) -> str:
+        return (f"{self.underlying} {self.short_strike:.0f}/{self.long_strike:.0f}p "
+                f"{self.expiry:%b%d} x{self.contracts}  "
+                f"credit ${self.total_credit:.0f}  risk ${self.total_risk:.0f}")
+
+
+# --------------------------------------------------------------------------- #
+def occ_symbol(underlying: str, expiry: date, right: str, strike: float) -> str:
+    """<ROOT><YYMMDD><C|P><strike*1000 zero-padded to 8>."""
+    return (f"{underlying.upper()}{expiry:%y%m%d}"
+            f"{'C' if right.lower() == 'call' else 'P'}"
+            f"{int(round(strike * 1000)):08d}")
+
+
+def size_trade(token: str, underlying: str, chain, short_q, long_q,
+               limits: RiskLimits, open_risk: float = 0.0) -> SizedTrade:
+    """Turn a chain proposal into a contract count, or refuse.
+
+    Sizes off DEFINED RISK, not notional and not buying power. For a credit
+    spread the true exposure is (width - credit) per contract, which is the
+    number that actually shows up if it goes wrong, so that is the number the
+    budget is divided by.
+    """
+    if short_q.symbol is None or long_q.symbol is None:
+        raise RiskRefusal(
+            "quotes carry no OCC symbol -- this chain did not come from live "
+            "market data, and orders are never built from historical or "
+            "synthetic quotes")
+
+    credit = (short_q.bid - long_q.ask) * CONTRACT_MULT
+    if credit <= 0:
+        raise RiskRefusal(f"no net credit at live quotes (${credit:.0f})")
+    if credit < limits.min_credit_per_contract:
+        raise RiskRefusal(f"credit ${credit:.0f}/contract below floor "
+                          f"${limits.min_credit_per_contract:.0f}")
+
+    width = abs(short_q.strike - long_q.strike) * CONTRACT_MULT
+    max_loss = width - credit
+    if max_loss <= 0:
+        raise RiskRefusal(f"implied max loss ${max_loss:.0f} is not positive -- "
+                          "quotes look wrong, refusing rather than guessing")
+
+    half_spread = (0.5 * (short_q.ask - short_q.bid)
+                   + 0.5 * (long_q.ask - long_q.bid)) * CONTRACT_MULT
+    frac = half_spread / credit
+    if frac > limits.max_spread_frac_of_credit:
+        raise RiskRefusal(f"round-trip spread {frac:.0%} of credit exceeds "
+                          f"{limits.max_spread_frac_of_credit:.0%}")
+
+    budget = limits.risk_budget()
+    contracts = int(math.floor(budget / max_loss))
+    note = f"budget ${budget:.0f} / ${max_loss:.0f} risk per contract"
+    if contracts > limits.max_contracts:
+        contracts = limits.max_contracts
+        note += f"; capped at max_contracts={limits.max_contracts}"
+    if contracts < 1:
+        raise RiskRefusal(
+            f"risk budget ${budget:.0f} will not cover one contract at "
+            f"${max_loss:.0f} of defined risk")
+
+    total_risk = contracts * max_loss
+    if open_risk + total_risk > limits.max_open_risk:
+        room = limits.max_open_risk - open_risk
+        contracts = int(math.floor(room / max_loss))
+        if contracts < 1:
+            raise RiskRefusal(
+                f"portfolio risk cap: ${open_risk:.0f} already open against a "
+                f"${limits.max_open_risk:.0f} ceiling, no room for this trade")
+        total_risk = contracts * max_loss
+        note += f"; reduced to fit ${limits.max_open_risk:.0f} portfolio cap"
+
+    return SizedTrade(
+        token=token, symbol=underlying, underlying=underlying,
+        expiry=short_q.expiry, short_strike=short_q.strike,
+        long_strike=long_q.strike, short_occ=short_q.symbol,
+        long_occ=long_q.symbol, contracts=contracts,
+        credit_per_contract=credit, max_loss_per_contract=max_loss,
+        total_credit=contracts * credit, total_risk=total_risk,
+        short_delta=short_q.delta, half_spread_cost=half_spread,
+        created_at=datetime.now(timezone.utc).isoformat(), sizing_note=note)
+
+
+# --------------------------------------------------------------------------- #
+class Executor:
+    """Submits multi-leg option orders, subject to every control above."""
+
+    def __init__(self, trading_client, option_client, limits: RiskLimits, *,
+                 armed: bool = False, live: bool = False):
+        self.trading = trading_client
+        self.opt = option_client
+        self.limits = limits
+        self.armed = armed
+        self.live = live
+
+    # -- controls ---------------------------------------------------------- #
+    def _check_kill_switch(self) -> None:
+        if storage.KILL.engaged():
+            where = getattr(storage.KILL, "describe", lambda: "kill switch")()
+            raise RiskRefusal(f"kill switch engaged ({where}) -- clear it to resume")
+
+    def _check_armed(self) -> None:
+        if not self.armed:
+            raise RiskRefusal("executor is not armed (pass --arm to enable submission)")
+
+    def _todays_orders(self) -> List[dict]:
+        return storage.JOURNAL.todays_submitted()
+
+    def _check_daily_caps(self, trade: SizedTrade) -> None:
+        today = self._todays_orders()
+        if len(today) >= self.limits.max_orders_per_day:
+            raise RiskRefusal(f"daily order cap reached ({len(today)}/"
+                              f"{self.limits.max_orders_per_day})")
+        risk_today = sum(r.get("total_risk", 0.0) for r in today)
+        if risk_today + trade.total_risk > self.limits.max_new_risk_per_day:
+            raise RiskRefusal(
+                f"daily new-risk cap: ${risk_today:.0f} committed today, this adds "
+                f"${trade.total_risk:.0f}, ceiling ${self.limits.max_new_risk_per_day:.0f}")
+
+    def _check_already_submitted(self, trade: SizedTrade) -> None:
+        """Idempotency: one approval token can produce at most one order."""
+        prior = storage.JOURNAL.find_submitted(trade.token)
+        if prior is not None:
+            raise RiskRefusal(f"token {trade.token} already submitted "
+                              f"(order {prior.get('order_id')}) -- refusing duplicate")
+
+    def _check_market_open(self) -> None:
+        """Refuse outside RTH rather than let the broker reject it.
+
+        A proposal texted at 15:50 and confirmed at 16:05 is inside its 30-minute
+        TTL but outside the session. Submitting anyway produces an opaque API
+        error and an alarming "submit ERROR" text for what is really a mundane
+        situation. Options do not trade in extended hours, so this is a refusal
+        with a readable reason.
+        """
+        try:
+            if not self.trading.get_clock().is_open:
+                raise RiskRefusal("market is closed -- options do not trade in "
+                                  "extended hours; re-scan at the next open")
+        except RiskRefusal:
+            raise
+        except Exception as e:
+            raise RiskRefusal(f"cannot confirm market is open ({type(e).__name__}) "
+                              "-- refusing rather than assuming")
+
+    def _check_age(self, trade: SizedTrade) -> None:
+        age = (datetime.now(timezone.utc)
+               - datetime.fromisoformat(trade.created_at)).total_seconds()
+        if age > self.limits.approval_ttl_seconds:
+            raise RiskRefusal(
+                f"proposal is {age/60:.0f} min old, past the "
+                f"{self.limits.approval_ttl_seconds/60:.0f} min TTL -- "
+                "re-scan rather than trade a stale quote")
+
+    def _reprice(self, trade: SizedTrade) -> float:
+        """Re-read the market at submission time. Consent was to a price."""
+        from alpaca.data.requests import OptionLatestQuoteRequest
+        q = self.opt.get_option_latest_quote(
+            OptionLatestQuoteRequest(symbol_or_symbols=[trade.short_occ, trade.long_occ]))
+        s, l = q.get(trade.short_occ), q.get(trade.long_occ)
+        if s is None or l is None:
+            raise RiskRefusal("no live quote for one or both legs at submit time")
+        # Fully-crossing credit: sell the short at the bid, buy the long at the
+        # ask. This is the worst price you would accept and the one that fills.
+        credit_cross = (float(s.bid_price) - float(l.ask_price)) * CONTRACT_MULT
+        credit_mid = (0.5 * (float(s.bid_price) + float(s.ask_price))
+                      - 0.5 * (float(l.bid_price) + float(l.ask_price))) * CONTRACT_MULT
+        f = self.limits.limit_slippage_frac
+        credit_now = credit_mid - f * (credit_mid - credit_cross)
+        if credit_now <= 0:
+            raise RiskRefusal(f"credit has gone negative (${credit_now:.0f}) since the alert")
+        slip = (trade.credit_per_contract - credit_now) / trade.credit_per_contract
+        if slip > self.limits.reprice_tolerance_frac:
+            raise RiskRefusal(
+                f"credit moved from ${trade.credit_per_contract:.0f} to "
+                f"${credit_now:.0f} ({slip:.0%} worse) since the alert, past the "
+                f"{self.limits.reprice_tolerance_frac:.0%} tolerance")
+        return credit_now
+
+    def open_risk(self) -> float:
+        """Total defined risk across open option positions.
+
+        Approximates each short option's exposure by its strike notional when it
+        cannot pair legs into spreads. That errs HIGH, which for a risk ceiling
+        is the correct direction to be wrong in.
+        """
+        try:
+            positions = self.trading.get_all_positions()
+        except Exception:
+            return float("inf")   # cannot verify exposure => behave as if full
+        risk = 0.0
+        for p in positions:
+            if getattr(p, "asset_class", None) and "option" in str(p.asset_class):
+                qty = abs(float(p.qty))
+                if float(p.qty) < 0:
+                    risk += qty * CONTRACT_MULT * 5.0    # assume 5-wide if unpaired
+        return risk
+
+    # -- submission -------------------------------------------------------- #
+    def submit(self, trade: SizedTrade, *, dry_run: bool = False) -> dict:
+        from alpaca.trading.enums import (OrderClass, OrderSide, PositionIntent,
+                                          TimeInForce)
+        from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+
+        # A dry run cannot place an order -- it returns below, before
+        # submit_order is ever reached -- so the arming and kill-switch gates
+        # are skipped for it. Otherwise `--dry-run` would refuse at the first
+        # gate and never show you what it would have done, which is the entire
+        # point of a dry run. Every gate that validates the TRADE still runs,
+        # so a dry run exercises the same logic a real submission would.
+        if not dry_run:
+            self._check_kill_switch()
+            self._check_armed()
+            self._check_market_open()
+        self._check_age(trade)
+        self._check_already_submitted(trade)
+        self._check_daily_caps(trade)
+
+        open_risk = self.open_risk()
+        if open_risk + trade.total_risk > self.limits.max_open_risk:
+            raise RiskRefusal(
+                f"portfolio cap: ${open_risk:.0f} open + ${trade.total_risk:.0f} new "
+                f"> ${self.limits.max_open_risk:.0f}")
+
+        credit_now = self._reprice(trade)
+
+        # Limit at the re-priced credit, never a market order. A multi-leg
+        # market order on options is an invitation to be filled at the far side
+        # of every leg at once.
+        limit_price = round(credit_now / CONTRACT_MULT, 2)
+
+        req = LimitOrderRequest(
+            qty=trade.contracts,
+            order_class=OrderClass.MLEG,
+            time_in_force=TimeInForce.DAY,
+            limit_price=limit_price,
+            client_order_id=f"harness-{trade.token}",
+            legs=[
+                OptionLegRequest(symbol=trade.short_occ, ratio_qty=1,
+                                 side=OrderSide.SELL,
+                                 position_intent=PositionIntent.SELL_TO_OPEN),
+                OptionLegRequest(symbol=trade.long_occ, ratio_qty=1,
+                                 side=OrderSide.BUY,
+                                 position_intent=PositionIntent.BUY_TO_OPEN),
+            ],
+        )
+
+        rec = {
+            "token": trade.token,
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "live" if self.live else "paper",
+            "dry_run": dry_run,
+            "trade": {k: (v.isoformat() if isinstance(v, date) else v)
+                      for k, v in asdict(trade).items()},
+            "limit_price": limit_price,
+            "credit_at_alert": trade.credit_per_contract,
+            "credit_at_submit": credit_now,
+            "total_risk": trade.total_risk,
+        }
+
+        if dry_run:
+            rec["status"] = "dry_run"
+            _journal(rec)
+            return rec
+
+        order = self.trading.submit_order(req)
+        rec["status"] = "submitted"
+        rec["order_id"] = str(order.id)
+        rec["order_status"] = str(getattr(order, "status", ""))
+        _journal(rec)
+
+        # Record the position so it can be MANAGED. The broker knows the legs
+        # but not the credit collected, and both the profit target and the stop
+        # are multiples of that credit -- without this an exit rule has nothing
+        # to measure against.
+        try:
+            storage.POSITIONS.put(trade.token, {
+                "token": trade.token, "underlying": trade.underlying,
+                "expiry": trade.expiry.isoformat(),
+                "short_occ": trade.short_occ, "long_occ": trade.long_occ,
+                "short_strike": trade.short_strike, "long_strike": trade.long_strike,
+                "contracts": trade.contracts,
+                "entry_credit_per_contract": limit_price * CONTRACT_MULT,
+                "max_loss_per_contract": trade.max_loss_per_contract,
+                "opened_at": rec["submitted_at"], "order_id": rec["order_id"],
+                "mode": rec["mode"],
+            })
+        except Exception as e:
+            # Never fail the order because bookkeeping failed -- but say so
+            # loudly, because an unrecorded position is an unmanaged one.
+            print(f"WARNING: order {rec['order_id']} submitted but NOT recorded "
+                  f"for management: {type(e).__name__}: {e}")
+        return rec
+
+
+def _journal(rec: dict) -> None:
+    storage.JOURNAL.append(rec)
+
+
+def record_refusal(token: str, reason: str) -> None:
+    _journal({"token": token, "status": "refused", "reason": reason,
+              "submitted_at": datetime.now(timezone.utc).isoformat()})

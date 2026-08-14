@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Options alert + staged execution. Three container Lambdas on schedules,
+  DynamoDB for state, SSM for secrets and runtime flags.
+
+  Deployed twice: a dev stack pointed at paper credentials and a prod stack.
+  Nothing about arming or live-money lives in this template -- both are SSM
+  parameters, so turning trading on or off is a CLI call that takes effect on
+  the next invocation and never depends on a deploy succeeding.
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: dev
+  ScanCron:
+    Type: String
+    # Every 5 min, 09:35-15:55 ET, weekdays. Cron is UTC; this is EDT. The
+    # handler re-checks the real market clock anyway, so DST drift costs a
+    # wasted invocation, never a wrong trade.
+    Default: 'cron(0/5 13-20 ? * MON-FRI *)'
+  RespondCron:
+    Type: String
+    Default: 'rate(1 minute)'
+  RefreshCron:
+    Type: String
+    Default: 'cron(30 11 ? * MON-FRI *)'
+  DayBriefCron:
+    Type: String
+    # 08:45 ET on weekdays (12:45 UTC during EDT) -- 45 min before the open, so
+    # a HALT sent in response lands well before the first scan at 09:35.
+    Default: 'cron(45 12 ? * MON-FRI *)'
+  ApprovalTtlSeconds:
+    Type: Number
+    Default: 1800
+  NtfyAlertsTopic:
+    Type: String
+    Default: ''
+    Description: Alerts topic, duplicated here so failure notices survive an SSM outage
+
+Globals:
+  Function:
+    Timeout: 120
+    MemorySize: 1024      # pandas import alone wants headroom; also buys CPU
+    Architectures: [x86_64]
+    Environment:
+      Variables:
+        STATE_TABLE: !Ref StateTable
+        PARAM_PREFIX: !Sub '/alpaca/${Env}'
+        KILL_PARAM: !Sub '/alpaca/${Env}/kill'
+        APPROVAL_TTL: !Ref ApprovalTtlSeconds
+        # Read from env, not SSM: a handler that crashed reading SSM cannot use
+        # SSM to tell you it crashed.
+        NTFY_ALERTS_FALLBACK: !Ref NtfyAlertsTopic
+
+Resources:
+
+  # ---- state ------------------------------------------------------------- #
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'alpaca-state-${Env}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      # Proposal expiry enforced by the database. A confirmation arriving after
+      # the TTL finds nothing, which is the correct answer.
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ---- kill switch is DELIBERATELY NOT DECLARED HERE ---------------------- #
+  #
+  # /alpaca/${Env}/kill is created by seed_params.sh and owned outside this
+  # stack, on purpose.
+  #
+  # A CloudFormation-managed parameter is reset to its template value on every
+  # deploy. That would mean: you hit the kill switch during an incident, someone
+  # ships an unrelated change, and the deploy silently sets kill back to "off"
+  # and resumes trading. An emergency stop that a routine deploy can undo is not
+  # an emergency stop.
+  #
+  # Keeping it outside the stack means the value persists across deploys, stack
+  # updates, and even stack deletion. SsmKillSwitch additionally fails CLOSED --
+  # an unreadable parameter reports engaged -- so deleting it halts trading
+  # rather than enabling it.
+
+  # ---- lambdas ------------------------------------------------------------ #
+  RefreshFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ../
+      DockerTag: !Sub 'refresh-${Env}'
+    Properties:
+      FunctionName: !Sub 'alpaca-refresh-${Env}'
+      PackageType: Image
+      ImageConfig:
+        Command: ['handlers.refresh']
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref StateTable}
+        # SSMParameterReadPolicy only covers GetParameter/GetParameters on a
+        # named parameter. Reading the whole prefix needs GetParametersByPath
+        # granted on the PATH resource, which is a separate action.
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:GetParametersByPath, ssm:GetParameter, ssm:GetParameters]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/alpaca/${Env}*'
+      Events:
+        Daily:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref RefreshCron
+
+  DayBriefFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ../
+      DockerTag: !Sub 'daybrief-${Env}'
+    Properties:
+      FunctionName: !Sub 'alpaca-daybrief-${Env}'
+      PackageType: Image
+      ImageConfig:
+        Command: ['handlers.daybrief']
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref StateTable}
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:GetParametersByPath, ssm:GetParameter, ssm:GetParameters]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/alpaca/${Env}*'
+      Events:
+        PreOpen:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref DayBriefCron
+
+  ScanFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ../
+      DockerTag: !Sub 'scan-${Env}'
+    Properties:
+      FunctionName: !Sub 'alpaca-scan-${Env}'
+      PackageType: Image
+      ImageConfig:
+        Command: ['handlers.scan']
+      Timeout: 300      # a full option-chain snapshot per symbol
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref StateTable}
+        # SSMParameterReadPolicy only covers GetParameter/GetParameters on a
+        # named parameter. Reading the whole prefix needs GetParametersByPath
+        # granted on the PATH resource, which is a separate action.
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:GetParametersByPath, ssm:GetParameter, ssm:GetParameters]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/alpaca/${Env}*'
+      Events:
+        MarketHours:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScanCron
+
+  RespondFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ../
+      DockerTag: !Sub 'respond-${Env}'
+    Properties:
+      FunctionName: !Sub 'alpaca-respond-${Env}'
+      PackageType: Image
+      ImageConfig:
+        Command: ['handlers.respond']
+      # The ONLY function that can place an order. It gets the same AWS
+      # permissions as the others -- the separation is that scan never
+      # constructs an armed Executor. Keeping it a distinct function means its
+      # logs, metrics, errors and concurrency are separately visible, and a
+      # runaway scan cannot become a runaway order path.
+      ReservedConcurrentExecutions: 1     # never two submitters at once
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref StateTable}
+        # SSMParameterReadPolicy only covers GetParameter/GetParameters on a
+        # named parameter. Reading the whole prefix needs GetParametersByPath
+        # granted on the PATH resource, which is a separate action.
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:GetParametersByPath, ssm:GetParameter, ssm:GetParameters]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/alpaca/${Env}*'
+      Events:
+        Poll:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref RespondCron
+
+  ManageFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ../
+      DockerTag: !Sub 'manage-${Env}'
+    Properties:
+      FunctionName: !Sub 'alpaca-manage-${Env}'
+      PackageType: Image
+      ImageConfig:
+        Command: ['handlers.manage']
+      Timeout: 120
+      # Exits, unlike entries, are not confirmed by you -- so like respond this
+      # gets its own function, its own logs, and single concurrency.
+      ReservedConcurrentExecutions: 1
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref StateTable}
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:GetParametersByPath, ssm:GetParameter, ssm:GetParameters]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/alpaca/${Env}*'
+      Events:
+        MarketHours:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScanCron
+
+  StatsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ../
+      DockerTag: !Sub 'stats-${Env}'
+    Properties:
+      FunctionName: !Sub 'alpaca-stats-${Env}'
+      PackageType: Image
+      ImageConfig:
+        Command: ['stats.handler']
+      Timeout: 30
+      # Read-only by construction: this handler never builds an Executor and
+      # never imports an order request. The Function URL is public (auth is a
+      # bearer token checked in code), so it is written assuming the token
+      # leaks -- the worst case must be disclosure, not a trade.
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ['*']
+          AllowHeaders: [authorization, content-type]
+          # OPTIONS is NOT a valid value here -- Function URLs answer preflight
+          # themselves, and listing it fails CloudFormation property validation.
+          AllowMethods: [GET]
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref StateTable}
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:GetParametersByPath, ssm:GetParameter, ssm:GetParameters]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/alpaca/${Env}*'
+
+  # ---- alarms ------------------------------------------------------------- #
+  RespondErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'alpaca-respond-errors-${Env}'
+      AlarmDescription: 'The order path is erroring. Investigate before arming.'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref RespondFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  StatsUrl:
+    Description: Read-only dashboard endpoint (requires the stats_token)
+    Value: !GetAtt StatsFunctionUrl.FunctionUrl
+  StateTableName:
+    Value: !Ref StateTable
+  KillSwitchParam:
+    Description: Owned outside this stack so a deploy can never reset it
+    Value: !Sub '/alpaca/${Env}/kill'
+  DisableCommand:
+    Description: Halt trading immediately, no deploy required
+    Value: !Sub 'aws ssm put-parameter --name /alpaca/${Env}/kill --value on --type String --overwrite'
+  ArmCommand:
+    Description: Allow order submission
+    Value: !Sub 'aws ssm put-parameter --name /alpaca/${Env}/armed --value on --type String --overwrite'
