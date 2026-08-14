@@ -52,6 +52,7 @@ class SpreadModel:
     dte_widening: float = 0.0     # extra half-spread as dte -> 0; 0.02 is a reasonable start
     max_half_frac: float = 0.5    # never let the model quote a spread wider than this * price
     use_moneyness: bool = False   # opt in to the measured moneyness curve
+    use_surface: bool = False     # opt in to the full moneyness x tenor surface
 
     # Effective spread as a fraction of mid, by how far OTM the contract is.
     # Measured from real retail SPX fills in Beckmeyer, Branger & Gayda (2023),
@@ -67,11 +68,50 @@ class SpreadModel:
                         (0.005, 0.070),   # 0.5-2% out of the money
                         (0.020, 0.446))   # >2% OTM -- the wing
 
+    # Spread depends on moneyness AND tenor, and the interaction is the whole
+    # story. Measured on SPY puts, 2026-08-14, n=1083 quoted contracts, median
+    # quoted spread as a fraction of mid:
+    #
+    #                 1-7 DTE   8-21 DTE   22+ DTE
+    #     ATM            0.8%       1.5%      0.8%
+    #     0.5-2% OTM     3.0%       1.5%      0.9%
+    #     2-5% OTM      15.4%       2.2%      0.9%
+    #     >5% OTM       28.6%       6.1%      1.1%
+    #
+    # A >5% OTM put is 26x more expensive to trade at 3 DTE than at 30 DTE: near
+    # expiry it is a near-worthless lottery ticket nobody quotes tightly, while
+    # at a month out it is a real contract. Beyond ~3 weeks moneyness barely
+    # matters at all -- everything quotes around 1%.
+    #
+    # A single-tenor curve applied across DTEs therefore gets the ranking of
+    # tenors badly wrong, which is exactly the error this table exists to fix.
+    _ES_SURFACE = (
+        (7,   ((0.000, 0.008), (0.005, 0.030), (0.020, 0.154), (0.050, 0.286))),
+        (21,  ((0.000, 0.015), (0.005, 0.015), (0.020, 0.022), (0.050, 0.061))),
+        (999, ((0.000, 0.008), (0.005, 0.009), (0.020, 0.009), (0.050, 0.011))),
+    )
+
+    def _es(self, moneyness: float, dte: int) -> float:
+        curve = self._ES_SURFACE[-1][1]
+        for dte_hi, c in self._ES_SURFACE:
+            if dte <= dte_hi:
+                curve = c
+                break
+        m, es = max(0.0, moneyness), curve[0][1]
+        for lo, val in curve:
+            if m >= lo:
+                es = val
+            else:
+                break
+        return es
+
     def half_spread(self, price: float, dte: int = 30,
                     moneyness: float = None) -> float:
         """`moneyness` = (spot - strike)/spot for a put; larger means further OTM."""
         if moneyness is None or not self.use_moneyness:
             half = max(self.min_half, self.pct_of_price * price)
+        elif self.use_surface:
+            half = max(self.min_half, 0.5 * self._es(moneyness, dte) * price)
         else:
             # The tuples are LOWER bounds, so take the last bucket the contract
             # has reached -- not the first bound it falls under, which charges a
@@ -123,11 +163,11 @@ class SpreadModel:
 
     @classmethod
     def spy_measured(cls) -> "SpreadModel":
-        """The curve actually quoted by SPY at 1-7 DTE. Preferred over both
-        tight() and retail_measured() for any SPY short-dated backtest."""
-        m = cls(min_half=0.005, pct_of_price=0.005, use_moneyness=True)
-        m._ES_BY_MONEYNESS = cls._ES_SPY_MEASURED
-        return m
+        """SPY's real quoted spread across moneyness AND tenor. This is the
+        curve to use for any SPY backtest; the others are the sensitivity
+        bounds around it."""
+        return cls(min_half=0.005, pct_of_price=0.005,
+                   use_moneyness=True, use_surface=True)
 
     @classmethod
     def retail_measured(cls) -> "SpreadModel":

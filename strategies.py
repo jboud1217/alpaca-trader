@@ -129,8 +129,19 @@ class PutCreditSpread(Strategy):
         # NOTE: entry_price here is the raw quote side; the engine re-fills with
         # the slippage model so accounting stays in one place. We pass the
         # conservative side just so a Position is well-formed if inspected early.
+        # Record the entry conditions, not just the delta. Without short_iv and
+        # the spot/strike context there is no way to ask afterwards whether
+        # entries at high implied vol did better than entries at low -- and
+        # that conditioning question cannot be answered retroactively, because
+        # the chain is gone once the backtest moves on.
         return Position(legs, chain.underlying, chain.as_of, tag=self.name,
-                        meta={"short_delta": short.delta})
+                        meta={"short_delta": short.delta,
+                              "short_iv": short.iv,
+                              "short_strike": short.strike,
+                              "long_iv": long.iv,
+                              "spot": chain.spot,
+                              "dte": (expiry - chain.as_of).days,
+                              "credit": short.bid - long.ask})
 
     def manage(self, position, chain):
         return self._default_manage(position, chain, self.profit_take,
