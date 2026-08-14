@@ -17,5 +17,5 @@ capabilities = "CAPABILITY_IAM"
 resolve_image_repos = true
 resolve_s3 = true
 image_repositories = []
-parameter_overrides = "Env=prod NtfyAlertsTopic=alpaca-alerts-IfIuknyToSNN SchedulesEnabled=false"
+parameter_overrides = "Env=prod NtfyAlertsTopic=alpaca-alerts-IfIuknyToSNN ScheduleState=DISABLED"
 confirm_changeset = false

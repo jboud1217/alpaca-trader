@@ -31,12 +31,18 @@ Parameters:
     # 08:45 ET on weekdays (12:45 UTC during EDT) -- 45 min before the open, so
     # a HALT sent in response lands well before the first scan at 09:35.
     Default: 'cron(45 12 ? * MON-FRI *)'
-  SchedulesEnabled:
+  ScheduleState:
     Type: String
-    AllowedValues: ['true', 'false']
-    Default: 'true'
+    AllowedValues: [ENABLED, DISABLED]
+    Default: ENABLED
     Description: >
-      Whether the EventBridge rules fire. This MUST be a template parameter and
+      Whether the EventBridge rules fire. Use State (ENABLED/DISABLED), NOT the
+      older boolean `Enabled` property: a String parameter carrying "false"
+      passed to `Enabled` is a non-empty string, which coerces to TRUE. That
+      failure is silent -- CloudFormation reports the parameter as false, the
+      template looks correct, and every rule comes up ENABLED anyway.
+
+      This MUST be a template parameter and
       not a manual CLI toggle. The rules default to enabled, so a stack whose
       schedules had been switched off with `aws events disable-rule` would have
       them silently switched back ON by the next deploy -- starting a scan loop
@@ -131,7 +137,7 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: !Ref RefreshCron
-            Enabled: !Ref SchedulesEnabled
+            State: !Ref ScheduleState
 
   DayBriefFunction:
     Type: AWS::Serverless::Function
@@ -155,7 +161,7 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: !Ref DayBriefCron
-            Enabled: !Ref SchedulesEnabled
+            State: !Ref ScheduleState
 
   ScanFunction:
     Type: AWS::Serverless::Function
@@ -183,7 +189,7 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: !Ref ScanCron
-            Enabled: !Ref SchedulesEnabled
+            State: !Ref ScheduleState
 
   RespondFunction:
     Type: AWS::Serverless::Function
@@ -216,7 +222,7 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: !Ref RespondCron
-            Enabled: !Ref SchedulesEnabled
+            State: !Ref ScheduleState
 
   ManageFunction:
     Type: AWS::Serverless::Function
@@ -244,7 +250,7 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: !Ref ScanCron
-            Enabled: !Ref SchedulesEnabled
+            State: !Ref ScheduleState
 
   StatsFunction:
     Type: AWS::Serverless::Function
