@@ -167,11 +167,18 @@ class SpreadModel:
     # which symbols are worth trading at all.
     #
     # IWM is 2-4x worse than SPY everywhere: 3.7% vs 1.0% at the money, 6.7%
-    # vs 2.3% just OTM. The cause is structural rather than incidental -- IWM
-    # trades near $304 against SPY's $776, so an identically wide nickel market
-    # is more than twice the percentage bite. Any low-priced underlying
-    # inherits this, which is why cheap tickers make poor premium-selling
-    # vehicles regardless of how liquid their SHARES are.
+    # vs 2.3% just OTM. The cause is structural -- IWM trades near $304 against
+    # SPY's $776, so an identically wide nickel market is more than twice the
+    # percentage bite.
+    #
+    # DO NOT conclude from this that IWM is the worse symbol to trade. That
+    # inference was made here and it was wrong. Spread as a fraction of MID is
+    # not the quantity that matters; spread cost as a fraction of CREDIT
+    # COLLECTED is, and IWM's higher volatility buys richer premium. Backtested
+    # on the deployed config, friction came out 7.6% for IWM against 5.1% for
+    # SPY -- 1.5x, not 4x -- and IWM had the HIGHEST expectancy of the three
+    # ($4.20/trade vs SPY's $0.52). The wide spread is largely paid for by the
+    # fat credit. Judge a symbol on friction/credit, never on spread/mid.
     _SURFACES = {
         "SPY": ((7,   ((0.000, 0.010), (0.005, 0.023), (0.020, 0.133), (0.050, 0.222))),
                 (21,  ((0.000, 0.012), (0.005, 0.016), (0.020, 0.022), (0.050, 0.061))),
