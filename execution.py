@@ -42,6 +42,25 @@ ORDER_JOURNAL = Path("orders.jsonl")
 CONTRACT_MULT = 100
 
 
+def flag_on(cfg, name: str) -> bool:
+    """Parse an SSM-style on/off flag. Canonical home is here, NOT in the AWS
+    handler, so the safety interlocks that depend on it can be tested without
+    importing boto3 or anything else AWS-shaped."""
+    return str(cfg.get(name, "")).strip().lower() in ("on", "true", "1", "yes")
+
+
+def auto_accept_effective(cfg) -> bool:
+    """Whether proposals should be auto-confirmed.
+
+    THE INTERLOCK: auto_accept is a paper-only convenience and is ignored
+    whenever live_money is on. The hazard was never auto-accept itself -- it is
+    auto-accept SURVIVING a flip to live, leaving an unattended trader spending
+    real money. Encoding that here means it cannot be forgotten, and means it
+    can be tested.
+    """
+    return flag_on(cfg, "auto_accept") and not flag_on(cfg, "live_money")
+
+
 class RiskRefusal(Exception):
     """Raised when a control blocks an order. Never caught silently."""
 

@@ -139,7 +139,7 @@ def _limits(cfg) -> ex.RiskLimits:
 
 
 def _flag(cfg, name) -> bool:
-    return str(cfg.get(name, "")).strip().lower() in ("on", "true", "1", "yes")
+    return ex.flag_on(cfg, name)
 
 
 def _clients(cfg, paper: bool):
@@ -513,14 +513,39 @@ def respond(event, context):
 
     pending = storage.PENDING.all()
     if not pending:
-        return _ok({"pending": 0, "commands": cmds, "halted": halt.engaged()})
+        return _ok({"pending": 0, "commands": cmds, "halted": halt.engaged(),
+                    "auto_accept": ex.auto_accept_effective(cfg)})
 
     executor = ex.Executor(clients["trading"], clients["option"], limits,
                            armed=armed, live=live)
-    try:
-        replies = notifier.poll_replies(list(pending), since)
-    except Exception as e:
-        return _ok({"error": f"poll failed: {type(e).__name__}: {e}"})
+    # --- auto-accept ------------------------------------------------------
+    # Treat every pending proposal as confirmed, without waiting for a reply.
+    #
+    # HARD INTERLOCK: this is IGNORED whenever live_money is on. The danger was
+    # never auto-accept on paper -- it is auto-accept SURVIVING a later flip to
+    # live, which would leave an unattended trader spending real money. Making
+    # that impossible in code beats remembering to unset a flag, so the two
+    # settings simply cannot both take effect.
+    auto = ex.auto_accept_effective(cfg)
+    if _flag(cfg, "auto_accept") and live:
+        msg = ("auto_accept is ON and live_money is ON -- refusing to "
+               "auto-confirm real-money trades. Proposals still require an "
+               "explicit reply. Unset auto_accept to silence this.")
+        print(f"[respond] REFUSED: {msg}")
+        notifier.send(f"[!] {msg}")
+        auto = False
+
+    if auto:
+        replies = [nt.Reply(token=t, confirmed=True, contracts=None,
+                            raw="<auto_accept>",
+                            received_at=datetime.now(timezone.utc))
+                   for t in list(pending)]
+        print(f"[respond] auto-accepting {len(replies)} proposal(s) (paper)")
+    else:
+        try:
+            replies = notifier.poll_replies(list(pending), since)
+        except Exception as e:
+            return _ok({"error": f"poll failed: {type(e).__name__}: {e}"})
 
     acted = []
     for r in replies:

@@ -844,6 +844,42 @@ class TestOpenRiskPairing(unittest.TestCase):
                      self._p("SPY260918P00772000", 1)])
         self.assertAlmostEqual(e.open_risk(), 500.0)
 
+
+class TestAutoAcceptInterlock(unittest.TestCase):
+    """auto_accept is a paper-only convenience. The hazard is not auto-accept
+    itself -- it is auto-accept surviving a later flip to live_money, leaving an
+    unattended trader spending real money. The two must not both take effect."""
+
+    def _flag(self, cfg, name):
+        return ex.flag_on(cfg, name)
+
+    def test_flag_parses_on_variants(self):
+        for v in ("on", "ON", "true", "1", "yes"):
+            self.assertTrue(self._flag({"auto_accept": v}, "auto_accept"), v)
+        for v in ("off", "false", "0", "no", "", "maybe"):
+            self.assertFalse(self._flag({"auto_accept": v}, "auto_accept"), v)
+
+    def test_bug_auto_accept_must_not_apply_when_live(self):
+        """The interlock: auto AND live must resolve to NOT auto."""
+        for auto_v, live_v, expect in (("on", "off", True),
+                                       ("on", "on", False),
+                                       ("off", "on", False),
+                                       ("off", "off", False)):
+            cfg = {"auto_accept": auto_v, "live_money": live_v}
+            effective = ex.auto_accept_effective(cfg)
+            self.assertEqual(effective, expect,
+                             f"auto={auto_v} live={live_v} -> {effective}")
+
+    def test_synthesized_reply_is_a_valid_confirmation(self):
+        """The auto path builds Reply objects the submit path already trusts."""
+        r = nt.Reply(token="A3F", confirmed=True, contracts=None,
+                     raw="<auto_accept>",
+                     received_at=datetime.now(timezone.utc))
+        self.assertTrue(r.confirmed)
+        self.assertIsNone(r.contracts, "must use the proposed size, not invent one")
+        self.assertEqual(r.token, "A3F")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
