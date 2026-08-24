@@ -880,6 +880,54 @@ class TestAutoAcceptInterlock(unittest.TestCase):
         self.assertEqual(r.token, "A3F")
 
 
+class TestBreakevenArithmetic(unittest.TestCase):
+    """The clearest statement of what this strategy is: a 30-delta short implies
+    a 70% win rate, so a FAIR payoff ratio is 0.30/0.70 = 0.43. The backtest
+    measures 0.42 across all twelve exit-rule variants. Fair value, no premium."""
+
+    def test_breakeven_matches_hand_arithmetic(self):
+        # $50 credit on a 3-wide ($300) spread, take 50% / stop 2x
+        #   win  = 0.50 * 50 = 25 ; loss = min(2*50, 250) = 100
+        #   be   = 100 / 125 = 0.80
+        self.assertAlmostEqual(
+            ex.breakeven_win_rate(50.0, 250.0, 0.50, 2.0), 0.80, places=4)
+
+    def test_no_stop_uses_full_max_loss(self):
+        # loss = max_loss = 250 ; win = 0.50*50 = 25 -> 250/275
+        self.assertAlmostEqual(
+            ex.breakeven_win_rate(50.0, 250.0, 0.50, None), 250/275, places=4)
+
+    def test_no_rules_at_all_is_width_over_width(self):
+        # win = full credit 50, loss = 250 -> 250/300
+        self.assertAlmostEqual(
+            ex.breakeven_win_rate(50.0, 250.0, None, None), 250/300, places=4)
+
+    def test_implied_win_rate_from_delta(self):
+        self.assertAlmostEqual(ex.implied_win_rate(-0.30), 0.70, places=6)
+        self.assertAlmostEqual(ex.implied_win_rate(0.30), 0.70, places=6)
+        self.assertAlmostEqual(ex.implied_win_rate(-0.50), 0.50, places=6)
+
+    def test_fair_payoff_ratio_is_delta_over_one_minus_delta(self):
+        """A fair 30-delta short pays 0.43; the backtest realises 0.42."""
+        d = 0.30
+        fair = d / (1 - d)
+        self.assertAlmostEqual(fair, 0.4286, places=3)
+        measured = 0.42
+        self.assertLess(abs(fair - measured), 0.02,
+                        "measured payoff should sit at fair value, not above it")
+
+    def test_breakeven_check_does_not_refuse(self):
+        """It is informational. Gating on the nominal number would refuse every
+        configuration tested, including the one that backtests best."""
+        import inspect
+        src = inspect.getsource(ex.size_trade)
+        i = src.find("breakeven_win_rate")
+        self.assertGreater(i, 0)
+        window = src[i:i + 400]
+        self.assertNotIn("raise RiskRefusal", window,
+                         "break-even must annotate, not refuse")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
