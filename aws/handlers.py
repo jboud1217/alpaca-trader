@@ -34,6 +34,7 @@ import boto3
 import dynamo_store
 import events as ev
 import execution as ex
+import gamma as gm
 import notify as nt
 import storage
 import weights as W
@@ -219,7 +220,33 @@ def refresh(event, context):
             rec["next_ex_div_error"] = f"{type(e).__name__}: {e}"
         cache.put(f"corpactions#{sym}", rec, ttl_seconds=172_800)
         out[sym] = rec
-    return _ok({"refreshed": out})
+
+    # Dealer net gamma exposure, recorded daily.
+    #
+    # This is pure accumulation, not something scan reads. Alpaca serves CURRENT
+    # open interest and no history, so the only way to ever test the conditional
+    # signal from Baltussen et al. (JFE 2021) -- intraday momentum has beta=6.63
+    # when dealers are net short gamma and beta=0.82, t=1.03, when they are long
+    # -- is to start writing it down and wait. Every day this does not run is a
+    # day that test can never cover.
+    #
+    # Failures are swallowed on purpose: a gamma snapshot is research data, and
+    # it must never be able to break the refresh that scan actually depends on.
+    gamma_out = {}
+    for sym in symbols:
+        try:
+            snap = gm.compute(clients["trading"], clients["option"],
+                              clients["stock"], sym, days_out=60)
+            gm.record(snap)
+            gamma_out[sym] = {"nge": round(snap.nge, 8),
+                              "net_dollars": round(snap.net_gamma_dollars),
+                              "dealers_short": snap.dealers_short_gamma,
+                              "contracts": snap.contracts_used,
+                              "oi_as_of": snap.oi_as_of}
+        except Exception as e:
+            gamma_out[sym] = {"error": f"{type(e).__name__}: {e}"}
+
+    return _ok({"refreshed": out, "gamma": gamma_out})
 
 
 # --------------------------------------------------------------------------- #

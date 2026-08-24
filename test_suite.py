@@ -928,6 +928,71 @@ class TestBreakevenArithmetic(unittest.TestCase):
                          "break-even must annotate, not refuse")
 
 
+
+class TestGammaExposure(unittest.TestCase):
+    """NGE = [sum_calls(gamma*OI*100*S) - sum_puts(...)] / market_value.
+    The sign convention encodes the standing assumption of this literature:
+    dealers are long every call and short every put."""
+
+    def _snap(self, **kw):
+        import gamma as gm
+        base = dict(as_of="2026-08-24T00:00:00Z", underlying="SPY", spot=700.0,
+                    call_gamma_dollars=0.0, put_gamma_dollars=0.0,
+                    net_gamma_dollars=0.0, nge=0.0, contracts_used=0,
+                    contracts_missing_oi=0, oi_as_of="2026-08-20",
+                    market_value=7e11)
+        base.update(kw)
+        return gm.GammaSnapshot(**base)
+
+    def test_more_put_gamma_means_dealers_short(self):
+        """Puts dominating -> net negative -> the regime the signal needs."""
+        s = self._snap(call_gamma_dollars=1.0e9, put_gamma_dollars=2.0e9,
+                       net_gamma_dollars=-1.0e9)
+        self.assertTrue(s.dealers_short_gamma)
+
+    def test_more_call_gamma_means_dealers_long(self):
+        s = self._snap(call_gamma_dollars=2.0e9, put_gamma_dollars=1.0e9,
+                       net_gamma_dollars=1.0e9)
+        self.assertFalse(s.dealers_short_gamma)
+
+    def test_zero_is_not_short(self):
+        """Baltussen split on NGE < 0, so exactly zero belongs to the
+        no-effect bucket."""
+        self.assertFalse(self._snap(net_gamma_dollars=0.0).dealers_short_gamma)
+
+
+class TestIntradaySignals(unittest.TestCase):
+    """Signal definitions, and the exit price that decided the result."""
+
+    def _day(self, prev=100.0, o930=100.0, c1000=101.0,
+             c1500=102.0, c1530=103.0, close=104.0):
+        import intraday as I
+        return I.Day(date(2026, 8, 24), prev, o930, c1000, c1500, c1530, close)
+
+    def test_signal_definitions(self):
+        d = self._day()
+        self.assertAlmostEqual(d.signal("onfh"), (101.0-100.0)/100.0)
+        self.assertAlmostEqual(d.signal("rod"),  (103.0-100.0)/100.0)
+        self.assertAlmostEqual(d.signal("r12"),  (103.0-102.0)/102.0)
+
+    def test_bug_target_uses_auction_print_not_1559_bar(self):
+        """The strategy exits in the closing auction. Its price is the DAILY
+        bar's close, which differs from the 15:59 minute bar by 0.1-0.6 bp --
+        up to a fifth of a ~2.7 bp edge."""
+        d = self._day(c1530=103.0, close=104.0)
+        self.assertAlmostEqual(d.target, (104.0-103.0)/103.0)
+
+    def test_unknown_signal_raises(self):
+        with self.assertRaises(ValueError):
+            self._day().signal("not_a_signal")
+
+    def test_cost_is_charged_per_trade(self):
+        """A signal with zero predictive content must lose exactly the cost."""
+        import intraday as I
+        days = [self._day(c1530=100.0, close=100.0) for _ in range(40)]
+        r = I.evaluate(days, "r12", cost_bp=0.30)
+        self.assertAlmostEqual(r["net_bp"], -0.30, places=6)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
