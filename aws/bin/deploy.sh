@@ -59,6 +59,23 @@ tot=$(aws events list-rules --profile "$PROFILE" --region "$REGION" \
 echo "rules $want: $got/$tot"
 [ "$got" = "$tot" ] || { echo "RULE STATE WRONG -- expected all $want"; exit 1; }
 
+# Smoke-test that the code actually imports and runs. UPDATE_COMPLETE means
+# CloudFormation swapped an image, not that the image works: gamma.py was once
+# imported by handlers.py but missing from the Dockerfile COPY list, and every
+# invocation died on ImportModuleError while the deploy reported success.
+echo "==> smoke test"
+for fn in refresh scan; do
+  out=$(mktemp)
+  aws lambda invoke --profile "$PROFILE" --region "$REGION" \
+      --function-name "alpaca-$fn-$ENVNAME" --payload '{}' \
+      --cli-binary-format raw-in-base64-out "$out" >/dev/null 2>&1 || true
+  if grep -q '"errorType"' "$out" 2>/dev/null; then
+    echo "  $fn FAILED:"; head -c 300 "$out"; echo; rm -f "$out"; exit 1
+  fi
+  echo "  $fn ok"
+  rm -f "$out"
+done
+
 for p in armed live_money kill auto_accept; do
   v=$(aws ssm get-parameter --profile "$PROFILE" --region "$REGION" \
       --name "/alpaca/$ENVNAME/$p" --query Parameter.Value --output text 2>/dev/null || echo "-")

@@ -10,9 +10,14 @@ RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements-lambda.txt
 # Shared logic, identical to what runs locally. Copied individually rather than
 # `COPY . .` so the 130MB+ .cache/ of downloaded option history and the local
 # .venv never end up in the image.
+# NOTE: this list is explicit, so a NEW module is invisible to the image until
+# it is added here. That is not hypothetical -- gamma.py was imported by
+# handlers.py, deployed clean, and every refresh invocation then died with
+# "No module named 'gamma'". The stack reported UPDATE_COMPLETE throughout.
+# If you add a module that handlers imports, add it on this line.
 COPY bsm.py trade.py data.py spread.py strategies.py engine.py metrics.py \
-     events.py weights.py execution.py notify.py storage.py \
-     ${LAMBDA_TASK_ROOT}/
+     events.py weights.py execution.py notify.py storage.py gamma.py \
+     intraday.py ${LAMBDA_TASK_ROOT}/
 COPY aws/handlers.py aws/dynamo_store.py aws/stats.py ${LAMBDA_TASK_ROOT}/
 
 # COPY preserves the source file mode. Several files in this repo are 0600
