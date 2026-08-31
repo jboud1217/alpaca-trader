@@ -797,54 +797,6 @@ class TestOpenRiskDetection(unittest.TestCase):
         self.assertEqual(e.open_risk(), float("inf"))
 
 
-class TestOpenRiskPairing(unittest.TestCase):
-    """Legs must pair into spreads. Assuming every short is 5-wide overstated a
-    3-wide book by 67% and would park the system at its ceiling with 40% of the
-    budget genuinely free."""
-
-    class _AC:
-        value = "us_option"
-        def __str__(self):
-            return "AssetClass.US_OPTION"
-
-    def _p(self, sym, qty):
-        return SimpleNamespace(symbol=sym, qty=str(qty), asset_class=self._AC())
-
-    def _e(self, positions):
-        return ex.Executor(SimpleNamespace(get_all_positions=lambda: positions),
-                           None, ex.RiskLimits())
-
-    def test_three_wide_spread_is_three_hundred(self):
-        e = self._e([self._p("SPY260817P00775000", -1),
-                     self._p("SPY260817P00772000", 1)])
-        self.assertAlmostEqual(e.open_risk(), 300.0)
-
-    def test_two_spreads_same_name_sum(self):
-        e = self._e([self._p("IWM260817P00303000", -1),
-                     self._p("IWM260817P00300000", 1),
-                     self._p("IWM260817P00302000", -1),
-                     self._p("IWM260817P00299000", 1)])
-        self.assertAlmostEqual(e.open_risk("IWM"), 600.0)
-
-    def test_naked_short_still_assumed_wide(self):
-        e = self._e([self._p("SPY260817P00775000", -1)])
-        self.assertAlmostEqual(e.open_risk(), 500.0)
-
-    def test_portfolio_equals_sum_of_names(self):
-        e = self._e([self._p("SPY260817P00775000", -1),
-                     self._p("SPY260817P00772000", 1),
-                     self._p("IWM260817P00303000", -1),
-                     self._p("IWM260817P00300000", 1)])
-        self.assertAlmostEqual(e.open_risk(),
-                               e.open_risk("SPY") + e.open_risk("IWM"))
-        self.assertAlmostEqual(e.open_risk(), 600.0)
-
-    def test_different_expiries_do_not_pair(self):
-        e = self._e([self._p("SPY260817P00775000", -1),
-                     self._p("SPY260918P00772000", 1)])
-        self.assertAlmostEqual(e.open_risk(), 500.0)
-
-
 class TestAutoAcceptInterlock(unittest.TestCase):
     """auto_accept is a paper-only convenience. The hazard is not auto-accept
     itself -- it is auto-accept surviving a later flip to live_money, leaving an
@@ -993,8 +945,6 @@ class TestIntradaySignals(unittest.TestCase):
         r = I.evaluate(days, "r12", cost_bp=0.30)
         self.assertAlmostEqual(r["net_bp"], -0.30, places=6)
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class TestOpenRiskPairing(unittest.TestCase):
@@ -1045,3 +995,129 @@ class TestOpenRiskPairing(unittest.TestCase):
         e = self._e([self._p("SPY260817P00775000", -1),
                      self._p("SPY260918P00772000", 1)])
         self.assertAlmostEqual(e.open_risk(), 500.0)
+
+
+# --------------------------------------------------------------------------- #
+class TestExitSettlement(unittest.TestCase):
+    """A close is not a close until it fills.
+
+    The shipped bug: manage() deleted the tracking record the instant
+    submit_order returned. A DAY limit that never filled left the spread open
+    at the broker with nothing tracking it, so no later cycle would ever try to
+    exit it again. One IWM 296/293 spread ran to expiry that way, unmanaged and
+    absent from open_risk.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(); self.cwd = os.getcwd(); os.chdir(self.tmp)
+        storage.use(positions=storage.FilePositionStore())
+        self.sent = []
+        self.notifier = SimpleNamespace(send=lambda m: self.sent.append(m))
+        self.pos = {"underlying": "IWM", "short_occ": "IWM260831P00296000",
+                    "long_occ": "IWM260831P00293000", "short_strike": 296,
+                    "long_strike": 293, "contracts": 1, "expiry": "2026-08-31",
+                    "entry_credit_per_contract": 48, "token": "M8P",
+                    "closing": {"order_id": "o1", "reason": "profit target 50%",
+                                "submitted_at": "2026-08-28T15:30:02+00:00",
+                                "limit_price": 0.25}}
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+
+    def _clients(self, status):
+        return {"trading": SimpleNamespace(
+            get_order_by_id=lambda oid: SimpleNamespace(status=status))}
+
+    def test_bug_unfilled_close_keeps_the_position_tracked(self):
+        import handlers
+        storage.POSITIONS.put("M8P", self.pos)
+        positions = storage.POSITIONS.all()
+        acted = []
+        flight = handlers._settle_closing(positions, self._clients("OrderStatus.NEW"),
+                                          self.notifier, acted)
+        # Still working: keep it, and do not submit a second close this cycle.
+        self.assertIn("M8P", flight)
+        self.assertIn("M8P", storage.POSITIONS.all())
+
+    def test_bug_expired_close_clears_marker_and_retries(self):
+        import handlers
+        storage.POSITIONS.put("M8P", self.pos)
+        positions = storage.POSITIONS.all()
+        acted = []
+        flight = handlers._settle_closing(positions,
+                                          self._clients("OrderStatus.EXPIRED"),
+                                          self.notifier, acted)
+        # The order died unfilled. The position must survive, with the marker
+        # cleared so the normal exit logic re-prices and resubmits.
+        self.assertNotIn("M8P", flight)
+        rec = storage.POSITIONS.all().get("M8P")
+        self.assertIsNotNone(rec)
+        self.assertNotIn("closing", rec)
+        self.assertTrue(any("did NOT fill" in m for m in self.sent))
+
+    def test_filled_close_removes_the_position(self):
+        import handlers
+        storage.POSITIONS.put("M8P", self.pos)
+        positions = storage.POSITIONS.all()
+        acted = []
+        handlers._settle_closing(positions, self._clients("OrderStatus.FILLED"),
+                                 self.notifier, acted)
+        self.assertEqual(storage.POSITIONS.all(), {})
+        self.assertIn("close confirmed", acted[0]["result"])
+
+    def test_reconcile_flags_a_broker_position_we_do_not_track(self):
+        import handlers
+        held = [SimpleNamespace(symbol="IWM260831P00296000", asset_class="us_option"),
+                SimpleNamespace(symbol="IWM260831P00293000", asset_class="us_option")]
+        clients = {"trading": SimpleNamespace(get_all_positions=lambda: held)}
+        out = handlers._reconcile(clients, {}, self.notifier)
+        self.assertEqual(len(out["untracked"]), 2)
+        self.assertTrue(any("UNTRACKED" in m for m in self.sent))
+
+    def test_reconcile_silent_when_everything_is_tracked(self):
+        import handlers
+        held = [SimpleNamespace(symbol="IWM260831P00296000", asset_class="us_option"),
+                SimpleNamespace(symbol="IWM260831P00293000", asset_class="us_option")]
+        clients = {"trading": SimpleNamespace(get_all_positions=lambda: held)}
+        out = handlers._reconcile(clients, {"M8P": self.pos}, self.notifier)
+        self.assertEqual(out["untracked"], [])
+        self.assertEqual(self.sent, [])
+
+    def test_reconcile_alerts_once_not_every_cycle(self):
+        """manage runs ~90 times a day. An unthrottled alert trains you to
+        ignore the one push that means money is moving unwatched."""
+        import handlers
+
+        class _Cache:
+            def __init__(self): self.v = {}
+            def get(self, k): return self.v.get(k)
+            def put(self, k, val, ttl_seconds=0): self.v[k] = val
+
+        cache = _Cache()
+        held = [SimpleNamespace(symbol="IWM260831P00296000", asset_class="us_option")]
+        clients = {"trading": SimpleNamespace(get_all_positions=lambda: held)}
+        for _ in range(5):
+            handlers._reconcile(clients, {}, self.notifier, cache)
+        self.assertEqual(len(self.sent), 1, "should alert once, not once per cycle")
+
+    def test_reconcile_realerts_when_the_set_changes(self):
+        import handlers
+
+        class _Cache:
+            def __init__(self): self.v = {}
+            def get(self, k): return self.v.get(k)
+            def put(self, k, val, ttl_seconds=0): self.v[k] = val
+
+        cache = _Cache()
+        one = [SimpleNamespace(symbol="IWM260831P00296000", asset_class="us_option")]
+        two = one + [SimpleNamespace(symbol="SPY260831P00763000",
+                                     asset_class="us_option")]
+        handlers._reconcile({"trading": SimpleNamespace(get_all_positions=lambda: one)},
+                            {}, self.notifier, cache)
+        handlers._reconcile({"trading": SimpleNamespace(get_all_positions=lambda: two)},
+                            {}, self.notifier, cache)
+        self.assertEqual(len(self.sent), 2, "a NEW orphan must break through")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

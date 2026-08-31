@@ -629,6 +629,111 @@ def respond(event, context):
                 "commands": cmds, "replies": len(replies), "acted": acted})
 
 
+def _order_state(clients, order_id):
+    """'filled' / 'dead' / 'live' for a submitted order, or 'live' if unreadable.
+
+    Unreadable deliberately maps to 'live': if we cannot prove an order is
+    finished, resubmitting could double the position, which is a worse failure
+    than waiting one more cycle.
+    """
+    try:
+        o = clients["trading"].get_order_by_id(order_id)
+    except Exception:
+        return "live"
+    s = str(getattr(o, "status", "")).rsplit(".", 1)[-1].lower()
+    if s == "filled":
+        return "filled"
+    if s in ("canceled", "cancelled", "expired", "rejected", "done_for_day"):
+        return "dead"
+    return "live"
+
+
+def _settle_closing(positions, clients, notifier, acted):
+    """Resolve positions that already have a close order in flight.
+
+    A close is not a close until it FILLS. This used to delete the tracking
+    record the instant submit_order returned, so a DAY limit that never filled
+    left the spread open at the broker and invisible to this function forever
+    -- nothing would ever try to exit it again, and it would run to expiry
+    unmanaged. One IWM spread was orphaned exactly that way.
+
+    Returns the tokens whose close is still working, so the caller skips them
+    and never submits a second close for the same position.
+    """
+    in_flight = set()
+    for token, p in list(positions.items()):
+        c = p.get("closing")
+        if not c:
+            continue
+        state = _order_state(clients, c.get("order_id"))
+        if state == "filled":
+            storage.POSITIONS.delete(token)
+            positions.pop(token, None)
+            notifier.send(f"[{token}] CLOSED — fill confirmed "
+                          f"({c.get('reason', '')})")
+            acted.append({"token": token,
+                          "result": f"close confirmed: {c.get('reason', '')}"})
+        elif state == "dead":
+            # Died without filling. Drop the marker so the normal exit logic
+            # re-evaluates at current quotes and submits a fresh order.
+            p.pop("closing", None)
+            storage.POSITIONS.put(token, p)
+            notifier.send(f"[{token}] close did NOT fill "
+                          f"({c.get('reason', '')}) — will retry at live quotes")
+            acted.append({"token": token, "result": "close did not fill, retrying"})
+        else:
+            in_flight.add(token)
+    return in_flight
+
+
+def _reconcile(clients, positions, notifier, cache=None):
+    """Alert on option positions the broker holds that the harness is not tracking.
+
+    Nothing else compares broker state to POSITIONS. Without this an untracked
+    spread is completely silent: absent from open_risk, never evaluated for an
+    exit, and the first you hear of it is assignment.
+
+    Notifies only when the untracked SET CHANGES. manage runs every 5 minutes
+    for eight hours, so alerting unconditionally would send ~90 identical
+    pushes a day and train you to swipe them away -- which would defeat the
+    only alert that means "money is moving with nothing watching it".
+    """
+    try:
+        held = clients["trading"].get_all_positions()
+    except Exception as e:
+        return {"reconcile_error": type(e).__name__}
+    known = set()
+    for p in positions.values():
+        known.add(str(p.get("short_occ")))
+        known.add(str(p.get("long_occ")))
+    stray = sorted(
+        str(h.symbol) for h in held
+        if str(getattr(h, "asset_class", "")).endswith("option")
+        and str(h.symbol) not in known)
+
+    if stray:
+        prev = None
+        if cache is not None:
+            try:
+                prev = (cache.get("reconcile#untracked") or {}).get("symbols")
+            except Exception:
+                prev = None
+        if prev != stray:
+            notifier.send("UNTRACKED at broker: " + ", ".join(stray) +
+                          "\nNot managed by this system. Close manually.")
+        if cache is not None:
+            try:
+                cache.put("reconcile#untracked", {"symbols": stray}, ttl_seconds=86_400)
+            except Exception:
+                pass
+    elif cache is not None:
+        try:
+            cache.put("reconcile#untracked", {"symbols": []}, ttl_seconds=86_400)
+        except Exception:
+            pass
+    return {"untracked": stray}
+
+
 # --------------------------------------------------------------------------- #
 @guarded("manage")
 def manage(event, context):
@@ -656,14 +761,23 @@ def manage(event, context):
     limits = _limits(cfg)
 
     positions = storage.POSITIONS.all()
-    if not positions:
-        return _ok({"managed": 0})
-    if not clients["trading"].get_clock().is_open:
-        return _ok({"skipped": "market closed", "open": len(positions)})
-
     notifier = nt.NtfyNotifier()
     acted = []
-    for token, p in positions.items():
+
+    # Reconcile BEFORE the empty check. The orphan case is precisely the one
+    # where POSITIONS is empty (or short an entry) while the broker still holds
+    # the spread -- returning early on "no positions" is how it stayed hidden.
+    recon = _reconcile(clients, positions, notifier, cache)
+
+    if not positions:
+        return _ok({"managed": 0, **recon})
+    if not clients["trading"].get_clock().is_open:
+        return _ok({"skipped": "market closed", "open": len(positions), **recon})
+
+    in_flight = _settle_closing(positions, clients, notifier, acted)
+    for token, p in list(positions.items()):
+        if token in in_flight:
+            continue
         try:
             verdict = _exit_verdict(p, clients, cfg, live)
         except Exception as e:
@@ -681,8 +795,13 @@ def manage(event, context):
             continue
         try:
             out = _close_position(clients, p, reason, limits, live)
-            storage.POSITIONS.delete(token)
-            notifier.send(f"[{token}] CLOSED ({reason})\n"
+            # NOT a delete. Mark the close as in flight and keep the position
+            # until the order is confirmed filled; _settle_closing removes it.
+            p["closing"] = {"order_id": out["order_id"], "reason": reason,
+                            "submitted_at": out["submitted_at"],
+                            "limit_price": out["limit_price"]}
+            storage.POSITIONS.put(token, p)
+            notifier.send(f"[{token}] CLOSE SUBMITTED ({reason})\n"
                           f"{p['underlying']} {p['short_strike']:.0f}/"
                           f"{p['long_strike']:.0f}p x{p['contracts']}\n"
                           f"debit ${out['limit_price']*100:.0f}/contract vs "
@@ -694,7 +813,7 @@ def manage(event, context):
         except Exception as e:
             notifier.send(f"[{token}] EXIT FAILED ({reason}): {type(e).__name__}")
             acted.append({"token": token, "result": f"exit error: {type(e).__name__}"})
-    return _ok({"open": len(positions), "acted": acted})
+    return _ok({"open": len(positions), "acted": acted, **recon})
 
 
 def _exit_verdict(p, clients, cfg, live):
