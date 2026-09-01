@@ -1119,5 +1119,27 @@ class TestExitSettlement(unittest.TestCase):
         self.assertEqual(len(self.sent), 2, "a NEW orphan must break through")
 
 
+    def test_bug_assigned_shares_are_flagged_too(self):
+        """A short put assigned at expiry becomes an EQUITY position. Filtering
+        reconcile on asset_class=='option' made the most expensive orphan --
+        100 shares of unmanaged stock -- the one case it could not see."""
+        import handlers
+        held = [SimpleNamespace(symbol="IWM", asset_class="us_equity", qty="100")]
+        clients = {"trading": SimpleNamespace(get_all_positions=lambda: held)}
+        out = handlers._reconcile(clients, {}, self.notifier)
+        self.assertEqual(out["untracked"], ["IWM"])
+        self.assertTrue(any("UNTRACKED" in m for m in self.sent))
+
+    def test_tracked_option_legs_still_do_not_alert(self):
+        """Widening the filter must not make the normal case noisy."""
+        import handlers
+        held = [SimpleNamespace(symbol="IWM260831P00296000", asset_class="us_option"),
+                SimpleNamespace(symbol="IWM260831P00293000", asset_class="us_option")]
+        clients = {"trading": SimpleNamespace(get_all_positions=lambda: held)}
+        out = handlers._reconcile(clients, {"M8P": self.pos}, self.notifier)
+        self.assertEqual(out["untracked"], [])
+        self.assertEqual(self.sent, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

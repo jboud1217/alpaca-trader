@@ -706,10 +706,13 @@ def _reconcile(clients, positions, notifier, cache=None):
     for p in positions.values():
         known.add(str(p.get("short_occ")))
         known.add(str(p.get("long_occ")))
-    stray = sorted(
-        str(h.symbol) for h in held
-        if str(getattr(h, "asset_class", "")).endswith("option")
-        and str(h.symbol) not in known)
+    # Every position, not just options. Filtering on asset_class missed the
+    # case that costs the most: a short put assigned at expiry becomes an
+    # EQUITY position -- 100 shares, ~$30k of notional -- which this system
+    # never opens, cannot manage, and would otherwise never mention. If the
+    # broker holds something the harness did not put there, say so whatever
+    # it is.
+    stray = sorted(str(h.symbol) for h in held if str(h.symbol) not in known)
 
     if stray:
         prev = None
