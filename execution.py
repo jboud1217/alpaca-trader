@@ -294,12 +294,22 @@ def size_trade(token: str, underlying: str, chain, short_q, long_q,
 
     budget = limits.risk_budget()
     contracts = int(math.floor(budget / max_loss))
-    note = f"budget ${budget:.0f} / ${max_loss:.0f} risk per contract" + be_note
+    note = (f"budget ${budget:.0f} / ${max_loss:.0f} risk per contract "
+            f"(${width / CONTRACT_MULT:.0f} wide)" + be_note)
     if contracts > limits.max_contracts:
         contracts = limits.max_contracts
         note += f"; capped at max_contracts={limits.max_contracts}"
     if contracts < 1:
+        # Name the actual structure. leg_at_offset() takes the NEAREST listed
+        # strike to (short - wing_width), so on a sparse chain -- a longer-dated
+        # expiry where the exact strike has no two-sided market -- the long wing
+        # lands further out and the spread is wider than wing_width asked for.
+        # The risk math stays correct because it uses the real strikes, but the
+        # bare number reads like arithmetic that cannot happen ("wing_width=3,
+        # so how is defined risk $308?"). Say the width and it explains itself.
         raise RiskRefusal(
+            f"{underlying} {short_q.strike:.0f}/{long_q.strike:.0f}p is "
+            f"${width / CONTRACT_MULT:.0f} wide (credit ${credit:.0f}); "
             f"risk budget ${budget:.0f} will not cover one contract at "
             f"${max_loss:.0f} of defined risk")
 

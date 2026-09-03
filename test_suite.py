@@ -1291,5 +1291,45 @@ class TestExpiryFloor(unittest.TestCase):
         self.assertGreater(dte, 1, "entry picked a DTE the exit closes at once")
 
 
+# --------------------------------------------------------------------------- #
+class TestSparseChainWidening(unittest.TestCase):
+    """leg_at_offset takes the NEAREST listed strike, so a sparse chain widens
+    the spread past wing_width. That is safe -- max_loss uses the real strikes
+    and the budget refuses what it cannot cover -- but on 2026-09-03 it surfaced
+    as "wing_width=3, so how is defined risk $308?", which reads like impossible
+    arithmetic. The refusal must name the width it actually got.
+    """
+
+    def _chain(self, strikes):
+        from data import OptionChain
+        exp = date(2026, 9, 11)
+        qs = [OptionQuote(right="put", strike=k, expiry=exp, bid=1.0, ask=1.1,
+                          delta=-0.30, iv=0.20, symbol=f"IWM{k:.0f}")
+              for k in strikes]
+        return OptionChain(date(2026, 9, 3), "IWM", 293.0, qs)
+
+    def test_missing_strike_widens_the_spread(self):
+        """No strike 3 below -> the wing lands 4 below, not nowhere."""
+        chain = self._chain([289.0, 290.0, 293.0])       # 290 present
+        leg = chain.leg_at_offset(date(2026, 9, 11), "put", 293.0, 3)
+        self.assertEqual(leg.strike, 290.0)
+
+        sparse = self._chain([289.0, 293.0])             # 290 absent
+        leg = sparse.leg_at_offset(date(2026, 9, 11), "put", 293.0, 3)
+        self.assertEqual(leg.strike, 289.0, "falls back to the nearest listed")
+
+    def test_refusal_names_the_realised_width(self):
+        """The message must explain itself without a log dive."""
+        L = ex.RiskLimits(max_risk_per_trade=300.0, account_equity=25_000.0,
+                          risk_per_trade_frac=0.02)
+        short_q = q(293, 5.00, 5.10, sym="S")
+        long_q = q(289, 4.05, 4.15, sym="L")             # 4 wide, not 3
+        with self.assertRaises(ex.RiskRefusal) as cm:
+            ex.size_trade("W1", "IWM", None, short_q, long_q, L)
+        msg = str(cm.exception)
+        self.assertIn("$4 wide", msg)
+        self.assertIn("293/289p", msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
