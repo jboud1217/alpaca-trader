@@ -59,8 +59,21 @@ class OptionChain:
     def expiries(self) -> List[date]:
         return sorted({q.expiry for q in self.quotes})
 
-    def nearest_expiry(self, target_dte: int) -> Optional[date]:
-        exps = self.expiries()
+    def nearest_expiry(self, target_dte: int,
+                       min_dte: int = 0) -> Optional[date]:
+        """The listed expiry closest to `target_dte`, never at or below `min_dte`.
+
+        The floor is not cosmetic. Selection used to go purely by distance to
+        the target, so on 2026-09-03 -- target 3 DTE, and Labor Day removing
+        the Monday expiry that normally sits nearest -- it chose Friday at
+        1 DTE. manage() closes anything at dte <= min_dte, so all three
+        positions opened at 13:35 were closed at 13:40 for min_dte<=1: three
+        round trips, five minutes held, six of the day's eight order slots
+        spent, and every later proposal refused for the rest of the session.
+
+        Entry must not select a DTE the exit rules reject on sight.
+        """
+        exps = [e for e in self.expiries() if (e - self.as_of).days > min_dte]
         if not exps:
             return None
         target = self.as_of + timedelta(days=target_dte)

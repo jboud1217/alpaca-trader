@@ -105,6 +105,12 @@ class DynamoJournal(storage.Journal, DynamoBackend):
         item = resp.get("Item")
         return _restore(item) if item else None
 
+    def todays_realized_pnl(self) -> float:
+        # One partition read, same as the cap query -- ORDER records are
+        # partitioned by day precisely so this stays a query and not a scan.
+        return sum(float(r.get("realized_pnl") or 0.0)
+                   for r in self.todays_submitted())
+
 
 class SsmKillSwitch(storage.KillSwitch):
     """Kill switch as an SSM parameter, so halting is a one-line CLI call with

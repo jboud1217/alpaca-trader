@@ -129,8 +129,9 @@ def _limits(cfg) -> ex.RiskLimits:
         max_contracts=num("max_contracts", 2, int),
         max_risk_per_trade=num("max_risk_per_trade", 750),
         max_open_risk=num("max_open_risk", 2500),
-        max_orders_per_day=num("max_orders_per_day", 3, int),
-        max_new_risk_per_day=num("max_new_risk_per_day", 1500),
+        # "none"/""/0 -> no count cap. Anything numeric still caps.
+        max_orders_per_day=ex.opt_int(cfg.get("max_orders_per_day")),
+        max_new_risk_per_day=num("max_new_risk_per_day", 1000),
         # TTL and re-price tolerance are a pair. The TTL bounds how stale a
         # quote can be when you tap; the tolerance catches what slips through.
         # Shortening the TTL trades missed proposals for fewer refusals.
@@ -879,9 +880,19 @@ def _close_position(clients, p, reason, limits, live):
                              position_intent=PositionIntent.SELL_TO_CLOSE),
         ])
     order = clients["trading"].submit_order(req)
+    # Realised P&L is recorded here because this is the only place that knows
+    # both sides: the entry credit lives on the position, the exit price is the
+    # debit just computed. The daily capital budget reads it back to credit a
+    # winner against the day's deployment. Priced off the submitted LIMIT, not
+    # the fill -- fills have been landing better than limits, so this frees
+    # slightly less budget than reality, which is the safe direction.
+    contracts = int(p["contracts"])
+    realized = (float(p["entry_credit_per_contract"]) - debit * 100.0) * contracts
+
     rec = {"token": f"CLOSE-{p['token']}", "status": "submitted",
            "submitted_at": datetime.now(timezone.utc).isoformat(),
            "mode": "live" if live else "paper", "reason": reason,
-           "order_id": str(order.id), "limit_price": debit, "total_risk": 0.0}
+           "order_id": str(order.id), "limit_price": debit, "total_risk": 0.0,
+           "realized_pnl": realized}
     ex._journal(rec)
     return rec

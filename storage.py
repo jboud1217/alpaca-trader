@@ -43,6 +43,16 @@ class Journal:
         """The submitted order for this token, if one exists. Idempotency."""
         raise NotImplementedError
 
+    def todays_realized_pnl(self) -> float:
+        """Net realised P&L across closes stamped with today's date.
+
+        Behind the interface for the same reason the daily-cap query is: a
+        caller that had to remember to sum this would eventually forget, and
+        the failure mode is a risk limit that silently measures the wrong
+        number.
+        """
+        raise NotImplementedError
+
 
 class KillSwitch:
     def engaged(self) -> bool:
@@ -120,6 +130,10 @@ class FileJournal(Journal):
             if r.get("token") == token and r.get("status") == "submitted":
                 return r
         return None
+
+    def todays_realized_pnl(self) -> float:
+        return sum(float(r.get("realized_pnl") or 0.0)
+                   for r in self.todays_submitted())
 
 
 class FileKillSwitch(KillSwitch):

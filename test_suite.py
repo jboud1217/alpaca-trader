@@ -270,13 +270,87 @@ class TestRiskControls(unittest.TestCase):
             e.submit(self.trade)
         self.assertEqual(t.n, 1, "one token must never produce two orders")
 
-    def test_daily_order_cap(self):
+    def test_daily_order_cap_when_configured(self):
+        """The count cap is optional now, but must still bite when set."""
+        self.L.max_orders_per_day = 3
+        self.L.max_new_risk_per_day = 10_000     # isolate the count cap
         e, t = self._executor()
-        for i in range(self.L.max_orders_per_day):
+        for i in range(3):
             e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": f"D{i}"}))
-        with self.assertRaises(ex.RiskRefusal):
+        with self.assertRaises(ex.RiskRefusal) as cm:
             e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "OVER"}))
-        self.assertEqual(t.n, self.L.max_orders_per_day)
+        self.assertIn("order cap", str(cm.exception))
+        self.assertEqual(t.n, 3)
+
+    def test_order_count_is_uncapped_by_default(self):
+        """Trade COUNT is no longer a control. Capital is.
+
+        The count cap measured the wrong thing: closes consumed it too, so a
+        day of exits locked out entries while barely any money was at risk.
+        """
+        self.assertIsNone(ex.RiskLimits().max_orders_per_day)
+        self.L.max_new_risk_per_day = 10_000
+        e, t = self._executor()
+        for i in range(9):
+            e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": f"N{i}"}))
+        self.assertEqual(t.n, 9, "nine orders must not trip a count cap")
+
+    # ---- daily capital budget ------------------------------------------ #
+    def _book_close(self, token, pnl):
+        """Journal a closed position with a realised result."""
+        storage.JOURNAL.append({
+            "token": f"CLOSE-{token}", "status": "submitted", "total_risk": 0.0,
+            "realized_pnl": pnl,
+            "submitted_at": datetime.now(timezone.utc).isoformat()})
+
+    def test_daily_capital_cap_blocks_the_trade_that_would_exceed_it(self):
+        self.L.max_new_risk_per_day = 1000.0
+        e, t = self._executor()
+        r = self.trade.total_risk
+        self.assertLess(2 * r, 1000.0, "fixture must allow two trades")
+        self.assertGreater(3 * r, 1000.0, "fixture must block the third")
+        e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "C1"}))
+        e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "C2"}))
+        with self.assertRaises(ex.RiskRefusal) as cm:
+            e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "C3"}))
+        self.assertIn("daily capital cap", str(cm.exception))
+        self.assertEqual(t.n, 2)
+
+    def test_realised_profit_frees_daily_budget(self):
+        """A closed winner hands the capital back, so the day may redeploy it."""
+        self.L.max_new_risk_per_day = 1000.0
+        e, t = self._executor()
+        e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "P1"}))
+        e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "P2"}))
+        with self.assertRaises(ex.RiskRefusal):
+            e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "P3"}))
+        self._book_close("P1", 500.0)            # a winner lands
+        out = e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "P4"}))
+        self.assertEqual(out["status"], "submitted")
+        self.assertEqual(t.n, 3)
+
+    def test_realised_loss_tightens_daily_budget(self):
+        """Symmetric by design: a losing day gets less rope, not the same rope."""
+        self.L.max_new_risk_per_day = 1000.0
+        e, t = self._executor()
+        e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "L1"}))
+        self._book_close("L1", -300.0)
+        # One trade deployed plus a $300 loss consumes enough that a second
+        # trade, which would otherwise fit, no longer does.
+        self.assertLess(2 * self.trade.total_risk, 1000.0)
+        with self.assertRaises(ex.RiskRefusal) as cm:
+            e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "L2"}))
+        self.assertIn("daily capital cap", str(cm.exception))
+        self.assertEqual(t.n, 1)
+
+    def test_closes_do_not_consume_deployment(self):
+        """A close carries total_risk 0: exiting must never eat entry budget."""
+        self.L.max_new_risk_per_day = 1000.0
+        e, t = self._executor()
+        for i in range(6):
+            self._book_close(f"X{i}", 0.0)
+        out = e.submit(ex.SizedTrade(**{**self.trade.__dict__, "token": "AFTER"}))
+        self.assertEqual(out["status"], "submitted")
 
     def test_dry_run_needs_no_arming(self):
         """Shipped bug: the armed check ran before the dry_run branch, so
@@ -1139,6 +1213,82 @@ class TestExitSettlement(unittest.TestCase):
         out = handlers._reconcile(clients, {"M8P": self.pos}, self.notifier)
         self.assertEqual(out["untracked"], [])
         self.assertEqual(self.sent, [])
+
+
+# --------------------------------------------------------------------------- #
+class TestOptIntParsing(unittest.TestCase):
+    """A cap that parses to the wrong thing is a safety control that lies."""
+
+    def test_spellings_that_mean_no_cap(self):
+        for v in (None, "", " ", "none", "NONE", "off", "unlimited", "null",
+                  "0", 0, "-3"):
+            self.assertIsNone(ex.opt_int(v), f"{v!r} should mean no cap")
+
+    def test_numeric_caps_survive(self):
+        self.assertEqual(ex.opt_int("12"), 12)
+        self.assertEqual(ex.opt_int(8), 8)
+        self.assertEqual(ex.opt_int("8.0"), 8)
+
+    def test_garbage_falls_back_to_the_default(self):
+        self.assertEqual(ex.opt_int("banana", 5), 5)
+        self.assertIsNone(ex.opt_int("banana"))
+
+
+# --------------------------------------------------------------------------- #
+class TestExpiryFloor(unittest.TestCase):
+    """Entry must never select a DTE the exit rules reject on sight.
+
+    Shipped bug (2026-09-03): nearest_expiry went purely by distance to the
+    target, so with target_dte=3 and Labor Day removing the Monday expiry it
+    chose Friday at 1 DTE. manage() closes at dte <= min_dte = 1, so three
+    positions opened at 13:35 were closed at 13:40 -- three round trips, five
+    minutes held, and the rest of the session refused.
+    """
+
+    AS_OF = date(2026, 9, 3)          # a Thursday
+
+    def _chain(self, expiries):
+        from data import OptionChain
+        qs = []
+        for e in expiries:
+            for k, d, px in ((289.0, -0.12, 0.40), (292.0, -0.30, 1.10),
+                             (294.0, -0.40, 1.80), (296.0, -0.50, 2.60)):
+                qs.append(OptionQuote(right="put", strike=k, expiry=e,
+                                      bid=px, ask=px * 1.2, delta=d, iv=0.20))
+        return OptionChain(self.AS_OF, "IWM", 293.0, qs)
+
+    def test_bug_does_not_pick_the_dte_the_exit_would_close(self):
+        # Friday is 1 DTE and nearest the 3-DTE target by raw distance; the
+        # next listing is 6 DTE. With min_dte=1, Friday must be excluded.
+        chain = self._chain([date(2026, 9, 4), date(2026, 9, 9)])
+        self.assertEqual(chain.nearest_expiry(3, 0), date(2026, 9, 4),
+                         "unfloored selection reproduces the bug")
+        self.assertEqual(chain.nearest_expiry(3, 1), date(2026, 9, 9),
+                         "floored selection must skip the 1-DTE expiry")
+
+    def test_same_day_expiry_is_never_selected(self):
+        chain = self._chain([self.AS_OF, date(2026, 9, 11)])
+        self.assertEqual(chain.nearest_expiry(3, 1), date(2026, 9, 11))
+
+    def test_returns_none_when_everything_is_below_the_floor(self):
+        """No tradeable expiry is a refusal, not a bad pick."""
+        chain = self._chain([date(2026, 9, 4)])
+        self.assertIsNone(chain.nearest_expiry(3, 1))
+
+    def test_floor_of_zero_preserves_old_behaviour_for_other_callers(self):
+        """events.atm_iv asks for ~30 DTE with no floor; it must be unaffected."""
+        chain = self._chain([date(2026, 9, 4), date(2026, 10, 2)])
+        self.assertEqual(chain.nearest_expiry(30), date(2026, 10, 2))
+
+    def test_strategy_entry_respects_its_own_min_dte(self):
+        from strategies import PutCreditSpread
+        chain = self._chain([date(2026, 9, 4), date(2026, 9, 9)])
+        s = PutCreditSpread(short_delta=0.30, wing_width=3, target_dte=3,
+                            profit_take=0.50, stop_mult=2.0, min_dte=1)
+        pos = s.propose_entry(chain, 0)
+        self.assertIsNotNone(pos)
+        dte = (pos.legs[0].expiry - self.AS_OF).days
+        self.assertGreater(dte, 1, "entry picked a DTE the exit closes at once")
 
 
 if __name__ == "__main__":

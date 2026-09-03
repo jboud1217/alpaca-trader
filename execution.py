@@ -49,6 +49,26 @@ def flag_on(cfg, name: str) -> bool:
     return str(cfg.get(name, "")).strip().lower() in ("on", "true", "1", "yes")
 
 
+def opt_int(value, default=None) -> Optional[int]:
+    """Parse an OPTIONAL integer cap. "", "none", "off", "unlimited" and any
+    non-positive number all mean NO CAP (None).
+
+    Canonical home is here beside flag_on, and for the same reason: a cap that
+    can silently parse to the wrong thing is a safety control, so it must be
+    testable without importing boto3.
+    """
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in ("", "none", "off", "unlimited", "no", "null"):
+        return None
+    try:
+        n = int(float(s))
+    except (TypeError, ValueError):
+        return default
+    return n if n > 0 else None
+
+
 def auto_accept_effective(cfg) -> bool:
     """Whether proposals should be auto-confirmed.
 
@@ -87,8 +107,20 @@ class RiskLimits:
     # even when fully spread out. Concentrating inside one name throws away the
     # little diversification that exists.
     max_open_risk_per_underlying_frac: float = 0.50
-    max_orders_per_day: int = 3
-    max_new_risk_per_day: float = 1_500.0
+    # None means the NUMBER of orders is not capped. The count cap was removed
+    # as a control because it measured the wrong thing: closes consume it too,
+    # so a day of exits could lock out entries while almost no capital was at
+    # risk. On 2026-09-03 a self-defeating open/close loop spent six of eight
+    # slots in five minutes and refused every later proposal, having deployed
+    # and returned the money within the same five minutes. What matters is
+    # capital at risk, which max_new_risk_per_day enforces directly.
+    max_orders_per_day: Optional[int] = None
+    # Capital the day may DEPLOY, net of what came back. Consumed budget is
+    # (defined risk opened today) - (net realised P&L today), so a winner frees
+    # room for the next trade and a loser tightens it. Note this is a NET
+    # figure by deliberate choice: a day that loses money gets less rope, not
+    # the same rope.
+    max_new_risk_per_day: float = 1_000.0
     min_credit_per_contract: float = 20.0  # below this, fees and spread dominate
     max_spread_frac_of_credit: float = 0.15
     reprice_tolerance_frac: float = 0.10   # abort if credit slipped >10% since the text
@@ -336,14 +368,28 @@ class Executor:
 
     def _check_daily_caps(self, trade: SizedTrade) -> None:
         today = self._todays_orders()
-        if len(today) >= self.limits.max_orders_per_day:
-            raise RiskRefusal(f"daily order cap reached ({len(today)}/"
-                              f"{self.limits.max_orders_per_day})")
-        risk_today = sum(r.get("total_risk", 0.0) for r in today)
-        if risk_today + trade.total_risk > self.limits.max_new_risk_per_day:
+
+        # Optional, and off by default. Kept because a numeric value is still
+        # a useful circuit breaker if an entry loop ever runs away again.
+        cap = self.limits.max_orders_per_day
+        if cap is not None and cap > 0 and len(today) >= cap:
+            raise RiskRefusal(f"daily order cap reached ({len(today)}/{cap})")
+
+        # Closes carry total_risk 0.0, so only entries count as deployment.
+        deployed = sum(r.get("total_risk", 0.0) for r in today)
+        try:
+            realized = float(storage.JOURNAL.todays_realized_pnl())
+        except (AttributeError, NotImplementedError):
+            # An older journal implementation cannot answer this. Fall back to
+            # gross deployment: stricter than intended, never looser.
+            realized = 0.0
+        consumed = deployed - realized
+        if consumed + trade.total_risk > self.limits.max_new_risk_per_day:
             raise RiskRefusal(
-                f"daily new-risk cap: ${risk_today:.0f} committed today, this adds "
-                f"${trade.total_risk:.0f}, ceiling ${self.limits.max_new_risk_per_day:.0f}")
+                f"daily capital cap: ${deployed:.0f} deployed, "
+                f"${realized:+.0f} realised, ${consumed:.0f} consumed; "
+                f"this adds ${trade.total_risk:.0f}, ceiling "
+                f"${self.limits.max_new_risk_per_day:.0f}")
 
     def _check_already_submitted(self, trade: SizedTrade) -> None:
         """Idempotency: one approval token can produce at most one order."""

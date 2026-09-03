@@ -96,7 +96,7 @@ def iv_percentile(series: List[float], current: float) -> Optional[float]:
 
 # --------------------------------------------------------------------------- #
 def evaluate(symbol: str, clients: dict, earnings: ev.EarningsCalendar, *,
-             target_dte: int = 3, max_dte: int = 60,
+             target_dte: int = 3, max_dte: int = 60, min_dte: int = 1,
              require_earnings_data: bool = True) -> Optional[dict]:
     """Gather events for one symbol, score them, and propose a concrete trade."""
     symbol = symbol.upper()
@@ -116,7 +116,7 @@ def evaluate(symbol: str, clients: dict, earnings: ev.EarningsCalendar, *,
     burst = ev.news_burst(clients["news"], symbol)
     exdiv, exdiv_src = ev.next_ex_dividend(clients["ca"], symbol)
 
-    expiry = chain.nearest_expiry(target_dte)
+    expiry = chain.nearest_expiry(target_dte, min_dte)
     if expiry is None:
         return {"symbol": symbol, "error": "no expiry near target dte"}
 
@@ -130,7 +130,7 @@ def evaluate(symbol: str, clients: dict, earnings: ev.EarningsCalendar, *,
 
     # ---- propose a concrete structure ---------------------------------- #
     strat = PutCreditSpread(short_delta=0.30, wing_width=3, target_dte=target_dte,
-                            profit_take=0.50, stop_mult=2.0, min_dte=1)
+                            profit_take=0.50, stop_mult=2.0, min_dte=min_dte)
     pos = strat.propose_entry(chain, 0)
     if pos is None:
         return {"symbol": symbol, "error": "no strike pair matched the template"}

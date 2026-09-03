@@ -123,8 +123,8 @@ def handler(event, context):
         max_contracts=_num("max_contracts", 2, int),
         max_risk_per_trade=_num("max_risk_per_trade", 750),
         max_open_risk=_num("max_open_risk", 2500),
-        max_orders_per_day=_num("max_orders_per_day", 3, int),
-        max_new_risk_per_day=_num("max_new_risk_per_day", 1500))
+        max_orders_per_day=ex.opt_int(cfg.get("max_orders_per_day")),
+        max_new_risk_per_day=_num("max_new_risk_per_day", 1000))
 
     out = {"ts": datetime.now(timezone.utc).isoformat(),
            "env": _PREFIX.rsplit("/", 1)[-1]}
@@ -255,13 +255,22 @@ def handler(event, context):
     out["pending"] = sorted(plist, key=lambda p: -p["expires_in_s"])
 
     # ---- risk envelope --------------------------------------------------- #
+    # The daily budget the executor enforces is NET: deployed minus realised.
+    # Reporting gross deployment here while the system gates on the net figure
+    # would put a number on the dashboard that no control actually uses, which
+    # is the same class of mistake as reporting default ceilings.
     risk_today = sum(float(r.get("total_risk", 0) or 0) for r in recs)
+    realized_today = sum(float(r.get("realized_pnl", 0) or 0) for r in recs)
+    consumed_today = risk_today - realized_today
     out["risk"] = {
         "budget_per_trade": limits.risk_budget(),
         "max_contracts": limits.max_contracts,
         "max_open_risk": limits.max_open_risk,
         "open_risk": sum(abs(p["cost_basis"]) for p in out.get("positions", [])),
-        "new_risk_today": risk_today,
+        "deployed_today": round(risk_today, 2),
+        "realized_today": round(realized_today, 2),
+        # What the cap is actually compared against.
+        "new_risk_today": round(consumed_today, 2),
         "max_new_risk_per_day": limits.max_new_risk_per_day,
     }
 

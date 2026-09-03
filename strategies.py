@@ -118,7 +118,7 @@ class PutCreditSpread(Strategy):
         self.abandon_delta = abandon_delta
 
     def propose_entry(self, chain, open_count):
-        expiry = chain.nearest_expiry(self.target_dte)
+        expiry = chain.nearest_expiry(self.target_dte, self.min_dte)
         if expiry is None:
             return None
         short = chain.select_by_delta(expiry, "put", self.short_delta)
@@ -182,7 +182,7 @@ class IronCondor(Strategy):
         self.abandon_delta = abandon_delta
 
     def propose_entry(self, chain, open_count):
-        expiry = chain.nearest_expiry(self.target_dte)
+        expiry = chain.nearest_expiry(self.target_dte, self.min_dte)
         if expiry is None:
             return None
         sp = chain.select_by_delta(expiry, "put", self.short_delta)
