@@ -191,6 +191,27 @@ Resources:
             Schedule: !Ref ScanCron
             State: !Ref ScheduleState
 
+  # Read-only chain diagnostic. No schedule and no Function URL: it runs only
+  # when invoked by hand, and it cannot trade by construction.
+  DiagFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ../
+      DockerTag: !Sub 'diag-${Env}'
+    Properties:
+      FunctionName: !Sub 'alpaca-diag-${Env}'
+      PackageType: Image
+      ImageConfig:
+        Command: ['handlers.diag']
+      Timeout: 300
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref StateTable}
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:GetParametersByPath, ssm:GetParameter, ssm:GetParameters]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/alpaca/${Env}*'
+
   RespondFunction:
     Type: AWS::Serverless::Function
     Metadata:

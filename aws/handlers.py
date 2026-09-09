@@ -739,6 +739,94 @@ def _reconcile(clients, positions, notifier, cache=None):
 
 
 # --------------------------------------------------------------------------- #
+@guarded("diag")
+def diag(event, context):
+    """Read-only chain diagnostic. THIS HANDLER CANNOT TRADE.
+
+    It never constructs an Executor, never imports an order request type, and
+    never writes to storage. It exists to answer the one question the scan log
+    cannot: the log says "credit $12 below floor $20", but not WHICH expiry and
+    WHICH strikes produced that, so there is no way to tell a genuinely thin
+    market apart from selection logic landing in the wrong place.
+
+    Invoke with {"symbols": ["IWM"]} to narrow it.
+    """
+    cfg, cache = _boot()
+    live = _flag(cfg, "live_money")
+    clients = _clients(cfg, paper=not live)
+
+    def num(key, default):
+        try:
+            return float(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    target_dte = int(num("target_dte", 3))
+    min_dte = int(num("min_dte", 1))
+    wing = num("wing_width", 3)
+    want_delta = num("short_delta", 0.30)
+    floor = num("min_credit_per_contract", 20)
+    max_frac = num("max_spread_frac_of_credit", 0.15)
+
+    syms = event.get("symbols") if isinstance(event, dict) else None
+    if not syms:
+        syms = [s.strip().upper()
+                for s in str(cfg.get("symbols", "SPY,QQQ,IWM")).split(",")
+                if s.strip()]
+
+    out = {}
+    for sym in syms:
+        try:
+            stats = ev.underlying_stats(clients["stock"], sym)
+            if stats is None:
+                out[sym] = {"error": "no underlying price history"}
+                continue
+            chain = ev.live_chain(clients["option"], sym, stats.spot, max_dte=60)
+            if chain is None:
+                out[sym] = {"error": "no live two-sided option market"}
+                continue
+
+            chosen = chain.nearest_expiry(target_dte, min_dte)
+            rows = []
+            for e in chain.expiries():
+                puts = chain.by_expiry(e, "put")
+                row = {"expiry": str(e), "dte": (e - chain.as_of).days,
+                       "n_puts": len(puts),
+                       "strike_lo": min((q.strike for q in puts), default=None),
+                       "strike_hi": max((q.strike for q in puts), default=None),
+                       "picked": (e == chosen)}
+                s = chain.select_by_delta(e, "put", want_delta)
+                if s is not None:
+                    row["short"] = {"k": s.strike, "delta": round(float(s.delta or 0), 3),
+                                    "bid": s.bid, "ask": s.ask}
+                    l = chain.leg_at_offset(e, "put", s.strike, wing)
+                    if l is not None and l.strike < s.strike:
+                        credit = round((s.bid - l.ask) * 100, 2)
+                        hs = round((0.5 * (s.ask - s.bid)
+                                    + 0.5 * (l.ask - l.bid)) * 100, 2)
+                        row["long"] = {"k": l.strike, "bid": l.bid, "ask": l.ask}
+                        row["width"] = round(abs(s.strike - l.strike), 2)
+                        row["credit"] = credit
+                        row["half_spread"] = hs
+                        row["spread_frac"] = round(hs / credit, 3) if credit > 0 else None
+                        row["verdict"] = (
+                            "ok" if credit >= floor and credit > 0
+                            and (hs / credit) <= max_frac
+                            else ("credit below floor" if credit < floor
+                                  else "spread too wide"))
+                rows.append(row)
+            out[sym] = {"spot": stats.spot, "chosen_expiry": str(chosen),
+                        "expiries": rows}
+        except Exception as e:
+            out[sym] = {"error": f"{type(e).__name__}: {e}"}
+
+    return _ok({"knobs": {"target_dte": target_dte, "min_dte": min_dte,
+                          "wing_width": wing, "short_delta": want_delta,
+                          "min_credit": floor, "max_spread_frac": max_frac},
+                "chains": out})
+
+
+# --------------------------------------------------------------------------- #
 @guarded("manage")
 def manage(event, context):
     """Exit management. The half of the strategy that was missing.
