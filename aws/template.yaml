@@ -14,6 +14,17 @@ Parameters:
     Type: String
     AllowedValues: [dev, prod]
     Default: dev
+  ManageCron:
+    Type: String
+    # Exits get their OWN cadence, faster than entries. manage used to share
+    # ScanCron at 5 minutes, and the cost was measurable: across 13 live stops
+    # the 2.0x rule REALISED at 3.15x credit (worst 6.17x) because nothing
+    # looked at the position between polls, and at 3-6 DTE gamma moves a spread
+    # a long way in five minutes. The profit target, which is not
+    # path-sensitive in the same way, realised at 0.53x against 0.50x nominal.
+    # Entries can wait five minutes; a stop cannot.
+    Default: 'rate(1 minute)'
+
   ScanCron:
     Type: String
     # Every 5 min, 09:35-15:55 ET, weekdays. Cron is UTC; this is EDT. The
@@ -270,7 +281,7 @@ Resources:
         MarketHours:
           Type: Schedule
           Properties:
-            Schedule: !Ref ScanCron
+            Schedule: !Ref ManageCron
             State: !Ref ScheduleState
 
   StatsFunction:
