@@ -631,22 +631,25 @@ def respond(event, context):
 
 
 def _order_state(clients, order_id):
-    """'filled' / 'dead' / 'live' for a submitted order, or 'live' if unreadable.
+    """('filled'|'dead'|'live', order or None). 'live' if unreadable.
 
     Unreadable deliberately maps to 'live': if we cannot prove an order is
     finished, resubmitting could double the position, which is a worse failure
     than waiting one more cycle.
+
+    The order itself comes back too, because realised P&L has to be priced off
+    the FILL and this object is the only thing carrying it.
     """
     try:
         o = clients["trading"].get_order_by_id(order_id)
     except Exception:
-        return "live"
+        return "live", None
     s = str(getattr(o, "status", "")).rsplit(".", 1)[-1].lower()
     if s == "filled":
-        return "filled"
+        return "filled", o
     if s in ("canceled", "cancelled", "expired", "rejected", "done_for_day"):
-        return "dead"
-    return "live"
+        return "dead", o
+    return "live", o
 
 
 def _settle_closing(positions, clients, notifier, acted):
@@ -666,13 +669,37 @@ def _settle_closing(positions, clients, notifier, acted):
         c = p.get("closing")
         if not c:
             continue
-        state = _order_state(clients, c.get("order_id"))
+        state, order = _order_state(clients, c.get("order_id"))
         if state == "filled":
+            # Realised P&L is booked HERE, against the actual fill price, not
+            # when the order was submitted. A close that never fills must not
+            # book a profit: CLOSE-M9B recorded +$21 at submit, then expired
+            # unfilled at the bell. That phantom $21 both flattered the day's
+            # realised total and freed daily capital budget that had not in
+            # fact come back.
+            debit = None
+            fill = getattr(order, "filled_avg_price", None) if order else None
+            if fill is not None:
+                try:
+                    debit = abs(float(fill)) * 100.0
+                except (TypeError, ValueError):
+                    debit = None
+            if debit is None:                  # no fill price: use the limit
+                debit = float(c.get("limit_price") or 0.0) * 100.0
+            realized = ((float(p.get("entry_credit_per_contract") or 0.0) - debit)
+                        * int(p.get("contracts") or 1))
+            ex._journal({"token": f"FILL-{token}", "status": "submitted",
+                         "submitted_at": datetime.now(timezone.utc).isoformat(),
+                         "mode": c.get("mode", "paper"),
+                         "reason": c.get("reason", ""),
+                         "order_id": c.get("order_id"),
+                         "fill_price": round(debit / 100.0, 4),
+                         "total_risk": 0.0, "realized_pnl": realized})
             storage.POSITIONS.delete(token)
             positions.pop(token, None)
             notifier.send(f"[{token}] CLOSED — fill confirmed "
-                          f"({c.get('reason', '')})")
-            acted.append({"token": token,
+                          f"({c.get('reason', '')}) P&L ${realized:+.0f}")
+            acted.append({"token": token, "realized_pnl": realized,
                           "result": f"close confirmed: {c.get('reason', '')}"})
         elif state == "dead":
             # Died without filling. Drop the marker so the normal exit logic
@@ -968,19 +995,12 @@ def _close_position(clients, p, reason, limits, live):
                              position_intent=PositionIntent.SELL_TO_CLOSE),
         ])
     order = clients["trading"].submit_order(req)
-    # Realised P&L is recorded here because this is the only place that knows
-    # both sides: the entry credit lives on the position, the exit price is the
-    # debit just computed. The daily capital budget reads it back to credit a
-    # winner against the day's deployment. Priced off the submitted LIMIT, not
-    # the fill -- fills have been landing better than limits, so this frees
-    # slightly less budget than reality, which is the safe direction.
-    contracts = int(p["contracts"])
-    realized = (float(p["entry_credit_per_contract"]) - debit * 100.0) * contracts
-
+    # NO realised_pnl here. Submitting a close is not closing -- this is a DAY
+    # limit and may expire unfilled. _settle_closing books the P&L against the
+    # actual fill, which is the only moment the money has really moved.
     rec = {"token": f"CLOSE-{p['token']}", "status": "submitted",
            "submitted_at": datetime.now(timezone.utc).isoformat(),
            "mode": "live" if live else "paper", "reason": reason,
-           "order_id": str(order.id), "limit_price": debit, "total_risk": 0.0,
-           "realized_pnl": realized}
+           "order_id": str(order.id), "limit_price": debit, "total_risk": 0.0}
     ex._journal(rec)
     return rec

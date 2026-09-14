@@ -23,7 +23,14 @@ Parameters:
     # a long way in five minutes. The profit target, which is not
     # path-sensitive in the same way, realised at 0.53x against 0.50x nominal.
     # Entries can wait five minutes; a stop cannot.
-    Default: 'rate(1 minute)'
+    #
+    # Bounded to market hours on weekdays. rate(1 minute) is NOT -- it fires
+    # 1,440 times a day including weekends, and each one reads SSM and calls
+    # get_all_positions before discovering the market is shut. Measured 1,440
+    # cycles on a Saturday. Alpaca returned 500s on 136 of 316 cycles on the
+    # Friday afternoon after that went in; causation unproven, but there is no
+    # reason to spend the calls.
+    Default: 'cron(* 13-20 ? * MON-FRI *)'
 
   ScanCron:
     Type: String

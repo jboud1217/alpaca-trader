@@ -1215,6 +1215,39 @@ class TestExitSettlement(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
 
+    def test_bug_unfilled_close_books_no_realised_pnl(self):
+        """CLOSE-M9B booked +$21 at submit, then expired unfilled at the bell.
+        That phantom profit flattered the day and freed daily capital budget
+        that had never actually come back."""
+        import handlers
+        storage.POSITIONS.put("M9B", self.pos)
+        positions = storage.POSITIONS.all()
+        handlers._settle_closing(positions,
+                                 self._clients("OrderStatus.EXPIRED"),
+                                 self.notifier, [])
+        booked = sum(float(r.get("realized_pnl") or 0)
+                     for r in storage.JOURNAL.todays_submitted())
+        self.assertEqual(booked, 0.0, "an unfilled close must book nothing")
+        self.assertIn("M9B", storage.POSITIONS.all())
+
+    def test_realised_pnl_uses_the_fill_not_the_limit(self):
+        """The limit is what we asked for; the fill is what happened."""
+        import handlers
+        storage.POSITIONS.put("M9B", self.pos)          # entry credit $48
+        positions = storage.POSITIONS.all()
+        filled = {"trading": SimpleNamespace(
+            get_order_by_id=lambda oid: SimpleNamespace(
+                status="OrderStatus.FILLED", filled_avg_price="0.10"))}
+        acted = []
+        handlers._settle_closing(positions, filled, self.notifier, acted)
+        # limit was 0.25 -> would book +$23; fill at 0.10 -> +$38.
+        self.assertAlmostEqual(acted[0]["realized_pnl"], 38.0)
+        booked = sum(float(r.get("realized_pnl") or 0)
+                     for r in storage.JOURNAL.todays_submitted())
+        self.assertAlmostEqual(booked, 38.0)
+        self.assertEqual(storage.POSITIONS.all(), {})
+
+
 # --------------------------------------------------------------------------- #
 class TestOptIntParsing(unittest.TestCase):
     """A cap that parses to the wrong thing is a safety control that lies."""
