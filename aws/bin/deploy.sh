@@ -59,6 +59,18 @@ tot=$(aws events list-rules --profile "$PROFILE" --region "$REGION" \
 echo "rules $want: $got/$tot"
 [ "$got" = "$tot" ] || { echo "RULE STATE WRONG -- expected all $want"; exit 1; }
 
+# Verify the SCHEDULE too, not just the state. A CloudFormation Parameter keeps
+# its previous value unless parameter_overrides names it, so editing a Default
+# in the template changes nothing on an existing stack -- and the deploy still
+# reports UPDATE_COMPLETE. Exits were left polling every minute around the clock
+# for a full deploy cycle because only rule STATE was being checked here.
+mgsched=$(aws events list-rules --profile "$PROFILE" --region "$REGION"   --query "Rules[?contains(Name,'alpaca-alerts-$ENVNAME-ManageFunction')].ScheduleExpression | [0]" --output text)
+echo "manage schedule: $mgsched"
+case "$mgsched" in
+  cron*MON-FRI*) ;;
+  *) echo "MANAGE SCHEDULE WRONG -- got '$mgsched', expected a market-hours cron"; exit 1 ;;
+esac
+
 # Smoke-test that the code actually imports and runs. UPDATE_COMPLETE means
 # CloudFormation swapped an image, not that the image works: gamma.py was once
 # imported by handlers.py but missing from the Dockerfile COPY list, and every
