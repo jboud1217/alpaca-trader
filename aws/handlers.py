@@ -457,9 +457,23 @@ def _evaluate_cached(symbol, clients, cal, cache, cfg=None):
     target_dte = int((cfg or {}).get("target_dte", 45))
     wing_width = float((cfg or {}).get("wing_width", 5))
     short_delta = float((cfg or {}).get("short_delta", 0.30))
-    expiry = chain.nearest_expiry(target_dte)
-    if expiry is None:
-        return {"error": "no expiry near 45 dte"}
+    min_dte = int((cfg or {}).get("min_dte", 1))
+
+    # Build the structure FIRST and take the expiry from the legs it actually
+    # chose. This used to call nearest_expiry() here with no floor, while
+    # propose_entry() applied its own min_dte -- two independent selections that
+    # silently disagreed once the floor was added. Strikes were then picked in
+    # one expiry and quoted in another: SPY sold at -0.135 delta on 09-08 with
+    # short_delta configured at 0.30, because a 22-DTE strike was looked up in a
+    # 3-DTE chain. Deriving expiry from the position makes that divergence
+    # impossible rather than merely fixed.
+    from strategies import PutCreditSpread
+    pos = PutCreditSpread(short_delta=short_delta, wing_width=wing_width,
+                          target_dte=target_dte, min_dte=min_dte
+                          ).propose_entry(chain, 0)
+    if pos is None:
+        return {"error": "no strike pair matched"}
+    expiry = pos.legs[0].expiry
 
     iv_atm = ev.atm_iv(chain, 30)
     slope = ev.term_structure_slope(chain)
@@ -475,11 +489,6 @@ def _evaluate_cached(symbol, clients, cal, cache, cfg=None):
     elif isinstance(nxt, date) and nxt <= expiry:
         vetoes.append(f"earnings {nxt} before expiry")
 
-    from strategies import PutCreditSpread
-    pos = PutCreditSpread(short_delta=short_delta, wing_width=wing_width,
-                          target_dte=target_dte).propose_entry(chain, 0)
-    if pos is None:
-        return {"error": "no strike pair matched"}
     sq = chain.find("put", max(l.strike for l in pos.legs), expiry)
     lq = chain.find("put", min(l.strike for l in pos.legs), expiry)
     if sq is None or lq is None:

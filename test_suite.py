@@ -1364,5 +1364,64 @@ class TestSparseChainWidening(unittest.TestCase):
         self.assertIn("293/289p", msg)
 
 
+# --------------------------------------------------------------------------- #
+class TestExpiryAgreement(unittest.TestCase):
+    """Strikes and expiry must come from ONE selection.
+
+    Shipped bug (2026-09-03 to 09-10): _evaluate_cached called nearest_expiry()
+    with no floor for its own `expiry`, while propose_entry() applied the
+    strategy's min_dte. Once a floor existed the two disagreed, so strikes were
+    chosen in a 22-DTE expiry and then quoted in a 3-DTE one. Live result: SPY
+    sold at -0.135 delta with short_delta configured at 0.30, and credits fell
+    to the $20 floor. Nothing raised, because the strike happened to exist in
+    both expiries.
+    """
+
+    AS_OF = date(2026, 9, 8)
+
+    def _chain(self):
+        from data import OptionChain
+        qs = []
+        # near expiry: 0.30 delta sits at 288; far expiry: 0.30 delta sits at 281
+        for strike, delta in ((292, -0.42), (288, -0.30), (285, -0.20),
+                              (281, -0.135), (278, -0.08)):
+            qs.append(OptionQuote(right="put", strike=float(strike),
+                                  expiry=date(2026, 9, 11), bid=1.0, ask=1.1,
+                                  delta=delta, iv=0.2, symbol=f"IWM260911P{strike}"))
+        for strike, delta in ((288, -0.52), (285, -0.42), (281, -0.30),
+                              (278, -0.22), (275, -0.15)):
+            qs.append(OptionQuote(right="put", strike=float(strike),
+                                  expiry=date(2026, 10, 2), bid=2.0, ask=2.1,
+                                  delta=delta, iv=0.2, symbol=f"IWM261002P{strike}"))
+        return OptionChain(self.AS_OF, "IWM", 291.0, qs)
+
+    def test_bug_strikes_and_expiry_must_match(self):
+        from strategies import PutCreditSpread
+        chain = self._chain()
+        # The strategy's own floor picks the far expiry...
+        far = PutCreditSpread(short_delta=0.30, wing_width=3, target_dte=3,
+                              min_dte=21).propose_entry(chain, 0)
+        self.assertEqual(far.legs[0].expiry, date(2026, 10, 2))
+        # ...and an unfloored nearest_expiry picks the near one. Quoting the
+        # far strike in the near expiry is what produced -0.135 delta live.
+        near = chain.nearest_expiry(3)
+        self.assertEqual(near, date(2026, 9, 11))
+        mismatched = chain.find("put", far.legs[0].strike, near)
+        self.assertIsNotNone(mismatched, "fixture must reproduce the silent case")
+        self.assertLess(abs(mismatched.delta), 0.20,
+                        "cross-expiry lookup yields a far-OTM strike")
+
+    def test_matched_selection_lands_on_target_delta(self):
+        """With one selection, the short leg sits at the configured delta."""
+        from strategies import PutCreditSpread
+        chain = self._chain()
+        pos = PutCreditSpread(short_delta=0.30, wing_width=3, target_dte=3,
+                              min_dte=1).propose_entry(chain, 0)
+        expiry = pos.legs[0].expiry
+        sq = chain.find("put", max(l.strike for l in pos.legs), expiry)
+        self.assertIsNotNone(sq)
+        self.assertAlmostEqual(abs(sq.delta), 0.30, places=2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
