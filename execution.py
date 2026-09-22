@@ -291,6 +291,22 @@ def size_trade(token: str, underlying: str, chain, short_q, long_q,
                             limits.profit_take, limits.stop_mult)
     iw = implied_win_rate(short_q.delta)
     be_note = f"; break-even {be:.0%} vs {iw:.0%} delta-implied"
+    # breakeven_slack is declared, documented as a refusal threshold, and read
+    # by nothing. That is deliberate as of 2026-09-21, and the attempt to
+    # "finish" it is recorded here so it is not retried:
+    #
+    # Enforcing `be > iw + slack` looks compelling on the reconstructed book,
+    # which splits on this number and nothing else -- the pre-2026-09-10 shape
+    # (take 0.50 / stop 2.0 / 0.30 delta) prints break-even 80% against 70%
+    # implied and lost $870 of the $944 total, while the current shape prints
+    # 75% against 80%. But those are the SAME numbers the backtest's best
+    # configuration prints, which is why turning the gate on refuses 25 of the
+    # suite's fixtures. The nominal caps cannot separate "lost money" from
+    # "tested well": most trades reach neither exit, so the requirement is
+    # overstated by the same amount in both cases.
+    #
+    # It stays informational. The note is the finding; the refusal is not
+    # available from this number.
 
     budget = limits.risk_budget()
     contracts = int(math.floor(budget / max_loss))

@@ -1423,5 +1423,155 @@ class TestExpiryAgreement(unittest.TestCase):
         self.assertAlmostEqual(abs(sq.delta), 0.30, places=2)
 
 
+# --------------------------------------------------------------------------- #
+class TestLimitsReachSsm(unittest.TestCase):
+    """_limits() promised every cap came from SSM. Six did not arrive.
+
+    The damaging one was stop_mult. SSM held 1.5 while the entry arithmetic
+    used the 2.0 dataclass default, so breakeven_win_rate was evaluated against
+    an exit rule the system does not run: every sizing_note read "break-even
+    80%" when the deployed rules require 75%. A risk gate computing against
+    stale exit rules is worse than no gate, because it reads as reassurance.
+    """
+
+    def _limits(self, cfg):
+        import handlers
+        return handlers._limits(cfg)
+
+    def test_bug_exit_rules_reach_the_entry_arithmetic(self):
+        lim = self._limits({"profit_take": "0.50", "stop_mult": "1.5"})
+        self.assertEqual(lim.stop_mult, 1.5)
+        self.assertEqual(lim.profit_take, 0.50)
+        # And the number the sizing note prints must follow from them.
+        be = ex.breakeven_win_rate(40.0, 260.0, lim.profit_take, lim.stop_mult)
+        self.assertAlmostEqual(be, 0.75, places=2)
+
+    def test_bug_friction_gate_reaches_the_trading_path(self):
+        """diag() read these from SSM; the trading path used the literals."""
+        lim = self._limits({"max_spread_frac_of_credit": "0.06",
+                            "min_credit_per_contract": "35",
+                            "limit_slippage_frac": "0.5"})
+        self.assertEqual(lim.max_spread_frac_of_credit, 0.06)
+        self.assertEqual(lim.min_credit_per_contract, 35.0)
+        self.assertEqual(lim.limit_slippage_frac, 0.5)
+
+    def test_absent_keys_keep_the_documented_defaults(self):
+        lim = self._limits({})
+        self.assertEqual(lim.max_spread_frac_of_credit, 0.15)
+        self.assertEqual(lim.limit_slippage_frac, 1.0)
+        self.assertEqual(lim.stop_mult, 2.0)
+        self.assertEqual(lim.breakeven_slack, 0.10)
+
+    def test_garbage_values_fall_back_rather_than_crash(self):
+        """A fat-fingered SSM write must not take the scanner down."""
+        lim = self._limits({"stop_mult": "", "limit_slippage_frac": "abc",
+                            "max_spread_frac_of_credit": None})
+        self.assertEqual(lim.stop_mult, 2.0)
+        self.assertEqual(lim.limit_slippage_frac, 1.0)
+        self.assertEqual(lim.max_spread_frac_of_credit, 0.15)
+
+
+# --------------------------------------------------------------------------- #
+class TestPhantomPositions(unittest.TestCase):
+    """The mirror of TestExitSettlement, on the entry side.
+
+    submit_spread writes POSITION# straight after submit_order returns, without
+    waiting for a fill. _reconcile only ever looked for the opposite error --
+    legs the broker holds that the harness does not track -- so a tracked
+    position the broker never opened was invisible.
+
+    At limit_slippage_frac=1.0 the entry is fully marketable and this cannot
+    happen. It is the thing standing between the book and paying less than the
+    whole half-spread, which is its largest measured cost.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(); self.cwd = os.getcwd(); os.chdir(self.tmp)
+        storage.use(positions=storage.FilePositionStore())
+        self.sent = []
+        self.notifier = SimpleNamespace(send=lambda m: self.sent.append(m))
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+
+    def _pos(self, age_seconds, **kw):
+        opened = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        p = {"underlying": "IWM", "short_occ": "IWM260831P00296000",
+             "long_occ": "IWM260831P00293000", "short_strike": 296,
+             "long_strike": 293, "contracts": 1, "expiry": "2026-08-31",
+             "entry_credit_per_contract": 48, "token": "M8P",
+             "opened_at": opened.isoformat()}
+        p.update(kw)
+        return p
+
+    def _clients(self, held=()):
+        return {"trading": SimpleNamespace(get_all_positions=lambda: list(held))}
+
+    def test_bug_tracked_but_never_filled_is_dropped(self):
+        positions = {"M8P": self._pos(3600)}
+        storage.POSITIONS.put("M8P", positions["M8P"])
+        out = handlers_mod()._reconcile(self._clients(), positions, self.notifier)
+        self.assertEqual(out["phantom"], ["M8P"])
+        self.assertNotIn("M8P", positions, "must stop consuming open_risk")
+        self.assertNotIn("M8P", storage.POSITIONS.all())
+        self.assertTrue(any("NOT HELD" in m for m in self.sent))
+
+    def test_a_phantom_is_dropped_not_closed(self):
+        """The reverse MLEG on a position that does not exist OPENS a debit
+        spread. Dropping is the only safe action."""
+        positions = {"M8P": self._pos(3600)}
+        clients = self._clients()
+        clients["trading"].submit_order = lambda *a, **k: self.fail(
+            "reconcile must never submit an order")
+        handlers_mod()._reconcile(clients, positions, self.notifier)
+
+    def test_recent_submission_is_left_alone(self):
+        """A fill reported seconds late must not look like a phantom."""
+        positions = {"M8P": self._pos(30)}
+        out = handlers_mod()._reconcile(self._clients(), positions, self.notifier)
+        self.assertEqual(out["phantom"], [])
+        self.assertIn("M8P", positions)
+
+    def test_position_in_flight_to_close_is_left_to_settle(self):
+        """_settle_closing owns these; a filled close legitimately leaves the
+        broker holding nothing while the marker is still set."""
+        positions = {"M8P": self._pos(3600, closing={"order_id": "o1"})}
+        out = handlers_mod()._reconcile(self._clients(), positions, self.notifier)
+        self.assertEqual(out["phantom"], [])
+        self.assertIn("M8P", positions)
+
+    def test_held_position_is_never_dropped(self):
+        held = [SimpleNamespace(symbol="IWM260831P00296000", asset_class="us_option"),
+                SimpleNamespace(symbol="IWM260831P00293000", asset_class="us_option")]
+        positions = {"M8P": self._pos(3600)}
+        out = handlers_mod()._reconcile(self._clients(held), positions, self.notifier)
+        self.assertEqual(out["phantom"], [])
+        self.assertEqual(out["untracked"], [])
+        self.assertEqual(self.sent, [])
+
+    def test_bug_a_failing_sweep_must_not_kill_the_exit_cycle(self):
+        """manage() calls _reconcile unguarded. A bookkeeping tidy-up that
+        throws would stop every stop-loss in the book from being evaluated."""
+        positions = {"M8P": self._pos(3600)}
+        boom = SimpleNamespace(send=lambda m: (_ for _ in ()).throw(RuntimeError("ntfy down")))
+        out = handlers_mod()._reconcile(self._clients(), positions, boom)
+        self.assertEqual(out["phantom"], ["M8P"])
+        self.assertNotIn("M8P", positions, "the drop still happened")
+
+    def test_one_leg_held_is_not_a_phantom(self):
+        """A half-filled spread is a real problem, but it is not this one, and
+        dropping it would hide it. Leave it tracked and let untracked speak."""
+        held = [SimpleNamespace(symbol="IWM260831P00296000", asset_class="us_option")]
+        positions = {"M8P": self._pos(3600)}
+        out = handlers_mod()._reconcile(self._clients(held), positions, self.notifier)
+        self.assertEqual(out["phantom"], [])
+        self.assertIn("M8P", positions)
+
+
+def handlers_mod():
+    import handlers
+    return handlers
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -137,6 +137,33 @@ def _limits(cfg) -> ex.RiskLimits:
         # Shortening the TTL trades missed proposals for fewer refusals.
         approval_ttl_seconds=num("approval_ttl", os.environ.get("APPROVAL_TTL", 1800), int),
         reprice_tolerance_frac=num("reprice_tolerance", 0.10),
+        # These six were the literals the docstring above promised did not
+        # exist. Each one was silently taking a dataclass default while SSM
+        # held a different value, and the gap was not cosmetic:
+        #
+        #   stop_mult   SSM said 1.5, the entry arithmetic used 2.0. So the
+        #               break-even printed in every sizing_note ("80% vs 80%
+        #               delta-implied") was computed against an exit rule the
+        #               system does not run. The true figure at 1.5x is 75%.
+        #   max_spread_frac_of_credit
+        #               the friction gate. At its 0.15 default it refused 0 of
+        #               57 reconstructed trades -- inert. Friction is the one
+        #               variable that separates this book: the cheapest third
+        #               of trades by half-spread/credit returned -$7.11 and the
+        #               priciest third -$34.74.
+        #   limit_slippage_frac
+        #               1.0 concedes the entire half-spread on entry AND exit,
+        #               ~$6.00 round trip against a measured -$16.56 expectancy.
+        #
+        # diag() already read min_credit_per_contract and
+        # max_spread_frac_of_credit from SSM, so the chain inspector was
+        # reporting on thresholds the trading path did not apply.
+        min_credit_per_contract=num("min_credit_per_contract", 20.0),
+        max_spread_frac_of_credit=num("max_spread_frac_of_credit", 0.15),
+        limit_slippage_frac=num("limit_slippage_frac", 1.0),
+        breakeven_slack=num("breakeven_slack", 0.10),
+        profit_take=num("profit_take", 0.50),
+        stop_mult=num("stop_mult", 2.0),
     )
 
 
@@ -751,6 +778,59 @@ def _reconcile(clients, positions, notifier, cache=None):
     # it is.
     stray = sorted(str(h.symbol) for h in held if str(h.symbol) not in known)
 
+    # The other direction, which nothing checked: positions the HARNESS tracks
+    # that the broker does not hold.
+    #
+    # submit_spread records POSITION# immediately after submit_order returns,
+    # without waiting for a fill. At limit_slippage_frac=1.0 the order is fully
+    # marketable and fills instantly, so this never bit. Lower that knob to pay
+    # less of the spread -- the single largest measured cost, ~$6.00 round trip
+    # against a -$16.56 expectancy -- and unfilled entries become routine.
+    #
+    # A phantom is not a cosmetic bookkeeping error. It consumes open_risk and
+    # blocks real trades, and manage would eventually submit a "close" for it:
+    # the reverse MLEG on a position that does not exist OPENS a debit spread,
+    # leaving real money in a direction nothing intended.
+    #
+    # Drop rather than close, because there is nothing to close. Only after the
+    # position is old enough that a fill would have been reported, and never
+    # while a close is in flight -- _settle_closing owns those.
+    # Wrapped whole. manage() calls _reconcile unguarded, so anything that
+    # escapes here takes the exit cycle down with it -- and a bookkeeping
+    # tidy-up that stops stops from firing is far worse than the phantom it
+    # was added to catch. Bookkeeping fails quiet; exits keep running.
+    phantom = []
+    try:
+        held_syms = {str(h.symbol) for h in held}
+        for token, p in list(positions.items()):
+            if p.get("closing"):
+                continue
+            legs = {str(p.get("short_occ")), str(p.get("long_occ"))}
+            if legs & held_syms:
+                continue
+            opened = str(p.get("opened_at") or "")
+            try:
+                age = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(opened)).total_seconds()
+            except (TypeError, ValueError):
+                age = 0.0      # unparseable timestamp: treat as new, act later
+            if age < 600:
+                continue
+            phantom.append(token)
+        for token in phantom:
+            positions.pop(token, None)
+            try:
+                storage.POSITIONS.delete(token)
+            except Exception:
+                pass
+            try:
+                notifier.send(f"[{token}] TRACKED BUT NOT HELD — entry never "
+                              f"filled. Dropped from management; no order sent.")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"WARNING: phantom sweep failed: {type(e).__name__}: {e}")
+
     if stray:
         prev = None
         if cache is not None:
@@ -771,7 +851,7 @@ def _reconcile(clients, positions, notifier, cache=None):
             cache.put("reconcile#untracked", {"symbols": []}, ttl_seconds=86_400)
         except Exception:
             pass
-    return {"untracked": stray}
+    return {"untracked": stray, "phantom": phantom}
 
 
 # --------------------------------------------------------------------------- #
