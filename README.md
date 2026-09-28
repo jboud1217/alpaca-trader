@@ -1,5 +1,10 @@
 # Options Research Harness
 
+> **Research project, not financial advice.** Nothing here has demonstrated an
+> edge, and the deployed stack trades a paper account only. If you run it, the
+> strategy selection, the risk and the money are yours. MIT-licensed, no
+> warranty -- see [LICENSE](LICENSE).
+
 A backtesting / strategy-development harness for defined-risk options
 strategies, built to plug into Alpaca. This is the **research instrument** — the
 thing you use to find and validate an edge *before* any execution infrastructure
