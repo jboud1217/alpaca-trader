@@ -7,7 +7,7 @@ capabilities = "CAPABILITY_IAM"
 resolve_image_repos = true
 resolve_s3 = true
 image_repositories = []
-parameter_overrides = "Env=dev NtfyAlertsTopic=alpaca-alerts-wyEb7SuBXRcM ManageCron=\"cron(* 13-20 ? * MON-FRI *)\""
+parameter_overrides = "Env=dev ManageCron=\"cron(* 13-20 ? * MON-FRI *)\""
 confirm_changeset = false
 
 [prod.deploy.parameters]
@@ -17,5 +17,5 @@ capabilities = "CAPABILITY_IAM"
 resolve_image_repos = true
 resolve_s3 = true
 image_repositories = []
-parameter_overrides = "Env=prod NtfyAlertsTopic=alpaca-alerts-IfIuknyToSNN ScheduleState=DISABLED ManageCron=\"cron(* 13-20 ? * MON-FRI *)\""
+parameter_overrides = "Env=prod ScheduleState=DISABLED ManageCron=\"cron(* 13-20 ? * MON-FRI *)\""
 confirm_changeset = false

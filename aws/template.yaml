@@ -71,10 +71,6 @@ Parameters:
   ApprovalTtlSeconds:
     Type: Number
     Default: 1800
-  NtfyAlertsTopic:
-    Type: String
-    Default: ''
-    Description: Alerts topic, duplicated here so failure notices survive an SSM outage
 
 Globals:
   Function:
@@ -88,8 +84,14 @@ Globals:
         KILL_PARAM: !Sub '/alpaca/${Env}/kill'
         APPROVAL_TTL: !Ref ApprovalTtlSeconds
         # Read from env, not SSM: a handler that crashed reading SSM cannot use
-        # SSM to tell you it crashed.
-        NTFY_ALERTS_FALLBACK: !Ref NtfyAlertsTopic
+        # SSM to tell you it crashed. CloudFormation resolves this reference at
+        # DEPLOY time and bakes the value into the environment, so it still
+        # survives a runtime SSM outage -- without the topic living in
+        # samconfig.toml, where it was committed. A topic name is a credential on
+        # ntfy.sh: the alert carries the reply-topic URL in its action buttons.
+        # CloudFormation does not notice when only the SSM value changes, so
+        # deploy.sh checks the two agree after every deploy.
+        NTFY_ALERTS_FALLBACK: !Sub '{{resolve:ssm:/alpaca/${Env}/ntfy_alerts}}'
 
 Resources:
 

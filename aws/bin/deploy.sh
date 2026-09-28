@@ -71,6 +71,19 @@ case "$mgsched" in
   *) echo "MANAGE SCHEDULE WRONG -- got '$mgsched', expected a market-hours cron"; exit 1 ;;
 esac
 
+# The failure-alert topic is resolved from SSM at deploy time. Rotating it in SSM
+# changes nothing on a stack whose template did not change, and failure alerts
+# would keep going to the old (possibly leaked) topic. Compare, never print.
+fb=$(aws lambda get-function-configuration --profile "$PROFILE" --region "$REGION" \
+     --function-name "alpaca-scan-$ENVNAME" \
+     --query 'Environment.Variables.NTFY_ALERTS_FALLBACK' --output text)
+cur=$(aws ssm get-parameter --profile "$PROFILE" --region "$REGION" \
+      --name "/alpaca/$ENVNAME/ntfy_alerts" --query Parameter.Value --output text)
+[ -n "$cur" ] && [ "$fb" = "$cur" ] || {
+  echo "FAILURE-ALERT TOPIC STALE -- Lambda env does not match SSM ntfy_alerts."
+  echo "Force an update (e.g. touch a comment in template.yaml) and redeploy."; exit 1; }
+echo "failure-alert topic matches SSM"
+
 # Smoke-test that the code actually imports and runs. UPDATE_COMPLETE means
 # CloudFormation swapped an image, not that the image works: gamma.py was once
 # imported by handlers.py but missing from the Dockerfile COPY list, and every
