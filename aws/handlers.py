@@ -162,13 +162,40 @@ def _limits(cfg) -> ex.RiskLimits:
         max_spread_frac_of_credit=num("max_spread_frac_of_credit", 0.15),
         limit_slippage_frac=num("limit_slippage_frac", 1.0),
         breakeven_slack=num("breakeven_slack", 0.10),
-        profit_take=num("profit_take", 0.50),
-        stop_mult=num("stop_mult", 2.0),
+        # opt_float, not num: "none" disables the rule. num() turned "none"
+        # into a ValueError and then into the 0.50/2.0 default.
+        profit_take=ex.opt_float(cfg.get("profit_take"), 0.50),
+        stop_mult=ex.opt_float(cfg.get("stop_mult"), 2.0),
     )
 
 
 def _flag(cfg, name) -> bool:
     return ex.flag_on(cfg, name)
+
+
+class _Session:
+    """Where in the trading day we are, from the broker's clock.
+
+    Not from a fixed UTC-4 offset: these windows are minutes wide, and EDT
+    ends on 2026-11-01. Alpaca's clock timestamps carry the exchange offset,
+    and next_close reflects early-close days, which a wall-clock 16:00 would
+    get wrong by three hours on the day after Thanksgiving.
+    """
+
+    def __init__(self, clock):
+        self.is_open = bool(clock.is_open)
+        now = clock.timestamp
+        self.today = now.date()                       # exchange-local date
+        session_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        self.minutes_since_open = (now - session_open).total_seconds() / 60.0
+        self.minutes_to_close = (clock.next_close - now).total_seconds() / 60.0
+
+
+def _cfg_float(cfg, key, default) -> float:
+    try:
+        return float(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _clients(cfg, paper: bool):
@@ -378,8 +405,25 @@ def scan(event, context):
     clients = _clients(cfg, paper=not live)
     limits = _limits(cfg)
 
-    if not clients["trading"].get_clock().is_open:
+    session = _Session(clients["trading"].get_clock())
+    if not session.is_open:
         return _ok({"skipped": "market closed"})
+
+    # Enter late in the session, not whenever the scan first fires. Two reasons,
+    # one measured here and one from the literature:
+    #   * half of the first 94 live entries filled in the opening half hour,
+    #     which is when option spreads are widest -- entry friction is paid
+    #     where it is most expensive;
+    #   * delta-hedged index option returns are negative OVERNIGHT and ~zero
+    #     intraday (Muravyev & Ni 2020, JFE). The premium is earned holding
+    #     through the close, so a position opened at 09:35 spends six hours
+    #     collecting nothing before the part that pays.
+    # entry_minutes_before_close=0 (or absent) leaves entries unrestricted.
+    window = _cfg_float(cfg, "entry_minutes_before_close", 0)
+    cutoff = _cfg_float(cfg, "entry_cutoff_minutes", 10)
+    if window > 0 and not (cutoff <= session.minutes_to_close <= window):
+        return _ok({"skipped": f"outside entry window ({session.minutes_to_close:.0f} "
+                               f"min to close; enters {window:.0f}-{cutoff:.0f})"})
 
     notifier = nt.NtfyNotifier()
     # Deliberately unarmed. This lambda proposes; it must never be able to trade.
@@ -537,7 +581,12 @@ def _evaluate_cached(symbol, clients, cal, cache, cfg=None):
     else:
         vetoes.append("no net credit")
 
-    series = storage.IV_HISTORY.record(symbol, iv_atm) if iv_atm else []
+    if ex.flag_on(cfg or {}, "veto_inverted_term"):
+        tv = W.term_structure_veto(slope, _cfg_float(cfg, "term_slope_floor", 0.0))
+        if tv:
+            vetoes.append(tv)
+
+    series =storage.IV_HISTORY.record(symbol, iv_atm) if iv_atm else []
     pct = None
     if len(series) >= 60 and iv_atm:
         pct = sum(1 for x in series if x <= iv_atm) / len(series)
@@ -799,7 +848,7 @@ def _reconcile(clients, positions, notifier, cache=None):
     # escapes here takes the exit cycle down with it -- and a bookkeeping
     # tidy-up that stops stops from firing is far worse than the phantom it
     # was added to catch. Bookkeeping fails quiet; exits keep running.
-    phantom = []
+    phantom, expired = [], []
     try:
         held_syms = {str(h.symbol) for h in held}
         for token, p in list(positions.items()):
@@ -807,6 +856,24 @@ def _reconcile(clients, positions, notifier, cache=None):
                 continue
             legs = {str(p.get("short_occ")), str(p.get("long_occ"))}
             if legs & held_syms:
+                continue
+            # Gone because it EXPIRED, not because it never filled. With
+            # min_dte=0 this is the normal end of most positions, and the
+            # phantom branch below used to swallow it: "entry never filled",
+            # no realised P&L, the credit never booked. Three of the August
+            # spreads that rode to expiry were lost from the journal that way.
+            try:
+                exp = date.fromisoformat(str(p.get("expiry"))[:10])
+            except (TypeError, ValueError):
+                exp = None
+            if exp is not None and exp < date.today():
+                _book_expiry(clients, token, p, notifier)
+                positions.pop(token, None)
+                try:
+                    storage.POSITIONS.delete(token)
+                except Exception:
+                    pass
+                expired.append(token)
                 continue
             opened = str(p.get("opened_at") or "")
             try:
@@ -851,7 +918,51 @@ def _reconcile(clients, positions, notifier, cache=None):
             cache.put("reconcile#untracked", {"symbols": []}, ttl_seconds=86_400)
         except Exception:
             pass
-    return {"untracked": stray, "phantom": phantom}
+    return {"untracked": stray, "phantom": phantom, "expired": expired}
+
+
+def _book_expiry(clients, token, p, notifier):
+    """Journal a spread that expired, priced at intrinsic off the expiry close.
+
+    Intrinsic at the close is the economic outcome whether the spread expired
+    worthless or not: a finish between the strikes means assignment, which
+    _reconcile reports separately as untracked stock. If the close cannot be
+    read the spread is booked worthless and SAYS it assumed so, because
+    _expiry_day_verdict closes anything near the money before the bell.
+    """
+    credit = float(p.get("entry_credit_per_contract") or 0.0)
+    n = int(p.get("contracts") or 1)
+    short_k, long_k = float(p["short_strike"]), float(p["long_strike"])
+    settle, note = None, ""
+    try:
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        exp = date.fromisoformat(str(p["expiry"])[:10])
+        bars = clients["stock"].get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=p["underlying"], timeframe=TimeFrame.Day,
+            start=datetime(exp.year, exp.month, exp.day, tzinfo=timezone.utc),
+            end=datetime(exp.year, exp.month, exp.day, tzinfo=timezone.utc)
+                + timedelta(days=1)))
+        rows = bars.data.get(p["underlying"]) or []
+        if rows:
+            settle = float(rows[-1].close)
+    except Exception:
+        settle = None
+    if settle is None:
+        intrinsic, note = 0.0, " (close unreadable: ASSUMED worthless)"
+    else:
+        intrinsic = max(0.0, min(short_k - long_k, short_k - settle)) * 100.0
+        note = f" (settle {settle:.2f})"
+    realized = (credit - intrinsic) * n
+    ex._journal({"token": f"EXPIRED-{token}", "status": "submitted",
+                 "submitted_at": datetime.now(timezone.utc).isoformat(),
+                 "mode": p.get("mode", "paper"), "reason": "expired",
+                 "settle": settle, "total_risk": 0.0, "realized_pnl": realized})
+    try:
+        notifier.send(f"[{token}] EXPIRED {p['underlying']} {short_k:.0f}/"
+                      f"{long_k:.0f}p{note} P&L ${realized:+.0f}")
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -979,7 +1090,8 @@ def manage(event, context):
 
     if not positions:
         return _ok({"managed": 0, **recon})
-    if not clients["trading"].get_clock().is_open:
+    session = _Session(clients["trading"].get_clock())
+    if not session.is_open:
         return _ok({"skipped": "market closed", "open": len(positions), **recon})
 
     in_flight = _settle_closing(positions, clients, notifier, acted)
@@ -987,7 +1099,7 @@ def manage(event, context):
         if token in in_flight:
             continue
         try:
-            verdict = _exit_verdict(p, clients, cfg, live)
+            verdict = _exit_verdict(p, clients, cfg, live, session)
         except Exception as e:
             acted.append({"token": token, "result": f"eval error: {type(e).__name__}"})
             continue
@@ -1024,34 +1136,106 @@ def manage(event, context):
     return _ok({"open": len(positions), "acted": acted, **recon})
 
 
-def _exit_verdict(p, clients, cfg, live):
-    """-> (reason, cost_to_close_per_contract) or None. Mirrors _default_manage."""
+def _exit_verdict(p, clients, cfg, live, session=None):
+    """-> (reason, cost_to_close_per_contract) or None. Mirrors _default_manage.
+
+    `session` is a _Session; None (tests, ad-hoc calls) disables the
+    time-of-day rules rather than guessing the time.
+    """
     from alpaca.data.requests import OptionLatestQuoteRequest
+
+    # Opening window: no exit decisions at all. 19 of the first 35 live stops
+    # fired between 09:30 and 10:00 ET -- overnight gaps landing on the day's
+    # widest option markets -- and 20 of 33 stopped spreads would have expired
+    # worthless had they been held. There is nothing a decision taken in that
+    # half hour knows that one taken at 10:00 does not, except a worse price.
+    if session is not None and \
+            session.minutes_since_open < _cfg_float(cfg, "quiet_open_minutes", 0):
+        return None
+
     q = clients["option"].get_option_latest_quote(
         OptionLatestQuoteRequest(symbol_or_symbols=[p["short_occ"], p["long_occ"]]))
     s, l = q.get(p["short_occ"]), q.get(p["long_occ"])
     if s is None or l is None:
         return None                       # no market: cannot price an exit
 
-    # Cost to flatten, crossing the spread (buy the short back at ask, sell the
-    # long at bid). The pessimistic side, because that is what you would pay.
-    cost = (float(s.ask_price) - float(l.bid_price)) * 100.0
+    # Two prices, kept apart on purpose.
+    #
+    # `cost` crosses the spread (short back at the ask, long out at the bid).
+    # That is what a close order is priced at, and it is returned for that.
+    #
+    # `mark` is the mid, and it is what the RULES trigger on. They used to
+    # trigger on `cost`, which put the whole quoted width of both legs inside
+    # the stop: across 99 live closes the fill came in $10.80 better than the
+    # crossing price, ~0.3x a typical $38 credit, so a "1.5x" stop was firing
+    # at ~1.2x of the real loss -- on quote width, not on the market moving.
+    sb, sa = float(s.bid_price), float(s.ask_price)
+    lb, la = float(l.bid_price), float(l.ask_price)
+    cost = (sa - lb) * 100.0
+    mark = (0.5 * (sb + sa) - 0.5 * (lb + la)) * 100.0
     credit = float(p["entry_credit_per_contract"])
-    pnl = credit - cost
+    pnl = credit - mark
 
     expiry = date.fromisoformat(str(p["expiry"])[:10])
-    dte = (expiry - date.today()).days
-    take = float(cfg.get("profit_take", 0.50))
-    stop = float(cfg.get("stop_mult", 2.0))
+    today = session.today if session is not None else date.today()
+    dte = (expiry - today).days
+    # "none" disables either rule. See profiles/measure.env for why both are
+    # off: the same 94 live trades held to expiry returned -$1.30/trade
+    # against -$18.70 as managed.
+    take = ex.opt_float(cfg.get("profit_take"), 0.50)
+    stop = ex.opt_float(cfg.get("stop_mult"), 2.0)
     min_dte = int(cfg.get("min_dte", 21))
 
-    if credit > 0 and pnl >= take * credit:
+    if take is not None and credit > 0 and pnl >= take * credit:
         return (f"profit target {int(take*100)}%", cost)
-    if credit > 0 and pnl <= -stop * credit:
+    if stop is not None and credit > 0 and pnl <= -stop * credit:
         return (f"stop {stop}x", cost)
-    if dte <= min_dte:
+    if min_dte > 0 and dte <= min_dte:
         return (f"min_dte<={min_dte}", cost)
+    if dte <= 0:
+        return _expiry_day_verdict(p, clients, cfg, session, cost)
     return None
+
+
+def _expiry_day_verdict(p, clients, cfg, session, cost):
+    """min_dte=0: hold to expiry, but do not carry PIN RISK into the bell.
+
+    A spread whose short leg finishes in the money, or close enough that an
+    after-hours move can put it there, gets assigned: 100 shares per contract,
+    roughly $70k of SPY, which the long put does not offset until it too is
+    exercised. So in the last `expiry_close_minutes` of expiry day, close any
+    spread whose short strike is not at least `pin_buffer` below spot. One
+    comfortably out of the money is left to expire -- that is the point of
+    holding, since a worthless spread bought back still pays the spread.
+
+    If spot cannot be read, close. Not knowing is not safe.
+    """
+    window = _cfg_float(cfg, "expiry_close_minutes", 30)
+    if session is not None and session.minutes_to_close > window:
+        return None
+    buffer = _cfg_float(cfg, "pin_buffer", 0.01)
+    spot = _spot(clients, p["underlying"])
+    short_k = float(p["short_strike"])
+    if spot is None:
+        return ("expiry: spot unreadable, closing", cost)
+    if spot < short_k * (1.0 + buffer):
+        return (f"expiry: spot {spot:.2f} within {buffer:.1%} of {short_k:.0f} short", cost)
+    return None
+
+
+def _spot(clients, symbol):
+    """Latest trade, IEX feed. Free-tier SIP withholds the last 15 minutes,
+    which is the whole window this is used in. IEX is a thin feed for
+    research (see 8fbf47f) but a fine one for 'is spot 1% above a strike'."""
+    try:
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockLatestTradeRequest
+        t = clients["stock"].get_stock_latest_trade(
+            StockLatestTradeRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX))
+        px = float(t[symbol].price)
+        return px if px > 0 else None
+    except Exception:
+        return None
 
 
 def _close_position(clients, p, reason, limits, live):

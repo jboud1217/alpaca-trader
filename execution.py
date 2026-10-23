@@ -69,6 +69,29 @@ def opt_int(value, default=None) -> Optional[int]:
     return n if n > 0 else None
 
 
+def opt_float(value, default=None) -> Optional[float]:
+    """Parse an OPTIONAL exit-rule multiple. "none", "off" and any
+    non-positive number mean the rule is DISABLED (None). An empty or
+    unparseable value is a fat-fingered write and takes the default: a typo
+    must not silently switch a stop off.
+
+    The exit path used to read profit_take/stop_mult with float(), so writing
+    "none" to SSM -- the obvious way to switch a rule off -- raised ValueError
+    in _limits and silently fell back to the 0.50/2.0 defaults. Switching a
+    rule off must not quietly switch it back on at a different value.
+    """
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in ("none", "off", "no", "null"):
+        return None
+    try:
+        x = float(s)
+    except (TypeError, ValueError):
+        return default
+    return x if x > 0 else None
+
+
 def auto_accept_effective(cfg) -> bool:
     """Whether proposals should be auto-confirmed.
 

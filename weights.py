@@ -225,6 +225,30 @@ def spread_veto(half_spread: Optional[float], credit: Optional[float]) -> Option
     return None
 
 
+def term_structure_veto(slope: Optional[float], floor: float = 0.0) -> Optional[str]:
+    """Inverted term structure is a VETO, not merely a negative weight.
+
+    Johnson (2017, JFQA) finds the VIX term-structure slope predicts returns to
+    variance sellers: steep contango, larger returns; flat or inverted, smaller
+    or negative. It is the best-supported timing signal in the literature, and
+    the one sign of it that matters is the inverted one -- the market bidding
+    near-dated vol over longer-dated is pricing a shock that has not happened
+    yet. Cheng (2019, RFS) is the reason this is a slope test and NOT a level
+    test: the premium does not rise when IV is high, so "sell when vol is
+    rich" has no support.
+
+    As a weight (0.12) it could be outvoted by the other factors, the same
+    failure spread_veto was added to stop. The proxy is ATM IV at 55 vs 14 DTE
+    on the traded chain, not VIX3M/VIX, so `floor` is in vol points of that
+    proxy. None (no term structure) does not veto -- an unmeasurable factor
+    drops out, it does not become a reason to refuse.
+    """
+    if slope is None or slope >= floor:
+        return None
+    return (f"term structure inverted (back-front {slope:+.3f} < {floor:+.3f}) "
+            "-- near-dated vol bid over back months")
+
+
 def norm_news_intensity(intensity: Optional[float]):
     """1.0 == normal coverage. Elevated coverage counts against."""
     if intensity is None:

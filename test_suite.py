@@ -1496,9 +1496,12 @@ class TestPhantomPositions(unittest.TestCase):
 
     def _pos(self, age_seconds, **kw):
         opened = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        # Expiry in the FUTURE: a phantom is an entry that never filled. One
+        # whose expiry has passed is an expiration -- see TestHoldToExpiry.
         p = {"underlying": "IWM", "short_occ": "IWM260831P00296000",
              "long_occ": "IWM260831P00293000", "short_strike": 296,
-             "long_strike": 293, "contracts": 1, "expiry": "2026-08-31",
+             "long_strike": 293, "contracts": 1,
+             "expiry": (date.today() + timedelta(days=5)).isoformat(),
              "entry_credit_per_contract": 48, "token": "M8P",
              "opened_at": opened.isoformat()}
         p.update(kw)
@@ -1566,6 +1569,171 @@ class TestPhantomPositions(unittest.TestCase):
         out = handlers_mod()._reconcile(self._clients(held), positions, self.notifier)
         self.assertEqual(out["phantom"], [])
         self.assertIn("M8P", positions)
+
+
+class TestHoldToExpiry(unittest.TestCase):
+    """The 2026-10-23 exit-rule change: trigger on the mid, allow both rules to
+    be switched off, hold to expiry, and close only what carries pin risk.
+
+    Measured on 94 live trades: as managed -$18.70/trade, the same trades held
+    to expiry -$1.30. The losses were in the exits, so these tests pin the
+    exits.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(); self.cwd = os.getcwd(); os.chdir(self.tmp)
+        storage.use(positions=storage.FilePositionStore())
+        self.sent = []
+        self.notifier = SimpleNamespace(send=lambda m: self.sent.append(m))
+        self.pos = {"token": "H2E", "underlying": "SPY",
+                    "expiry": (date.today() + timedelta(days=4)).isoformat(),
+                    "short_occ": "S", "long_occ": "L",
+                    "short_strike": 700.0, "long_strike": 697.0, "contracts": 1,
+                    "entry_credit_per_contract": 40.0,
+                    "max_loss_per_contract": 260.0, "mode": "paper"}
+        self.cfg = {"profit_take": "none", "stop_mult": "none", "min_dte": "0",
+                    "quiet_open_minutes": "30", "expiry_close_minutes": "30",
+                    "pin_buffer": "0.01"}
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+
+    def _clients(self, s_bid, s_ask, l_bid, l_ask, spot=None):
+        class O:
+            def get_option_latest_quote(_, r):
+                return {"S": SimpleNamespace(bid_price=s_bid, ask_price=s_ask),
+                        "L": SimpleNamespace(bid_price=l_bid, ask_price=l_ask)}
+
+        class St:
+            def get_stock_latest_trade(_, r):
+                if spot is None:
+                    raise RuntimeError("feed down")
+                return {"SPY": SimpleNamespace(price=spot)}
+        return {"option": O(), "stock": St()}
+
+    @staticmethod
+    def _session(since_open=120.0, to_close=200.0, today=None):
+        return SimpleNamespace(is_open=True, today=today or date.today(),
+                               minutes_since_open=since_open,
+                               minutes_to_close=to_close)
+
+    def _verdict(self, clients, cfg=None, pos=None, session=None):
+        return handlers_mod()._exit_verdict(pos or self.pos, clients,
+                                            cfg or self.cfg, False, session)
+
+    # -- parsing ------------------------------------------------------------
+    def test_opt_float_none_disables(self):
+        for v in ("none", "off", "0", "-1", None):
+            self.assertIsNone(ex.opt_float(v), v)
+        self.assertEqual(ex.opt_float("", 2.0), 2.0, "a blank write is a typo")
+        self.assertEqual(ex.opt_float("1.5"), 1.5)
+        self.assertEqual(ex.opt_float("garbage", 0.5), 0.5)
+
+    def test_bug_none_in_ssm_used_to_mean_the_default(self):
+        """num('none') raised ValueError and fell back to 0.50 / 2.0."""
+        lim = handlers_mod()._limits({"profit_take": "none", "stop_mult": "none"})
+        self.assertIsNone(lim.profit_take)
+        self.assertIsNone(lim.stop_mult)
+
+    def test_breakeven_with_no_exit_rules_is_max_loss_over_width(self):
+        self.assertAlmostEqual(ex.breakeven_win_rate(40.0, 260.0, None, None),
+                               260.0 / 300.0, places=3)
+
+    # -- triggers on the mid -------------------------------------------------
+    def test_bug_stop_fired_on_quote_width_not_on_the_market(self):
+        """Crossing price says -1.6x; the mid says -1.2x. A 1.5x stop must hold."""
+        cfg = dict(self.cfg, stop_mult="1.5")
+        # mid cost = 0.95 - 0.07 = 0.88 -> pnl -48 (-1.2x)
+        # natural  = 1.05 - 0.01 = 1.04 -> pnl -64 (-1.6x)
+        self.assertIsNone(self._verdict(self._clients(0.85, 1.05, 0.01, 0.13), cfg))
+        v = self._verdict(self._clients(1.10, 1.30, 0.05, 0.15), cfg)  # mid -1.8x
+        self.assertIn("stop", v[0])
+        self.assertAlmostEqual(v[1], (1.30 - 0.05) * 100, places=6,
+                               msg="the close is still PRICED at the crossing side")
+
+    def test_no_rules_means_no_exit_before_expiry_day(self):
+        self.assertIsNone(self._verdict(self._clients(2.40, 2.60, 0.10, 0.20)))
+        self.assertIsNone(self._verdict(self._clients(0.01, 0.02, 0.00, 0.01)))
+
+    def test_quiet_open_suppresses_every_exit(self):
+        cfg = dict(self.cfg, stop_mult="1.5")
+        clients = self._clients(2.40, 2.60, 0.10, 0.20)
+        self.assertIsNone(self._verdict(clients, cfg, session=self._session(since_open=10)))
+        self.assertIn("stop", self._verdict(clients, cfg, session=self._session(since_open=45))[0])
+
+    def test_min_dte_zero_does_not_roll_off_at_the_open_of_expiry_day(self):
+        exp = dict(self.pos, expiry=date.today().isoformat())
+        self.assertIsNone(self._verdict(self._clients(0.01, 0.02, 0.0, 0.01, spot=720),
+                                        pos=exp, session=self._session(to_close=200)))
+
+    # -- expiry day ------------------------------------------------------------
+    def _expiry(self, spot):
+        exp = dict(self.pos, expiry=date.today().isoformat())
+        return self._verdict(self._clients(0.01, 0.02, 0.0, 0.01, spot=spot),
+                             pos=exp, session=self._session(to_close=20))
+
+    def test_expiry_day_closes_inside_the_pin_buffer(self):
+        self.assertIn("expiry", self._expiry(705.0)[0])      # 0.7% above 700
+
+    def test_expiry_day_closes_when_in_the_money(self):
+        self.assertIn("expiry", self._expiry(698.0)[0])
+
+    def test_expiry_day_lets_a_safe_spread_expire(self):
+        self.assertIsNone(self._expiry(712.0))               # 1.7% above 700
+
+    def test_expiry_day_closes_when_spot_is_unknown(self):
+        self.assertIn("unreadable", self._expiry(None)[0])
+
+    # -- bookkeeping -----------------------------------------------------------
+    def _expired_pos(self):
+        return dict(self.pos, expiry=(date.today() - timedelta(days=1)).isoformat(),
+                    opened_at=(datetime.now(timezone.utc) - timedelta(days=7)).isoformat())
+
+    def _bars(self, close):
+        bars = SimpleNamespace(data={"SPY": [SimpleNamespace(close=close)]})
+        return SimpleNamespace(get_stock_bars=lambda r: bars)
+
+    def test_bug_an_expired_spread_was_swept_as_never_filled(self):
+        positions = {"H2E": self._expired_pos()}
+        storage.POSITIONS.put("H2E", positions["H2E"])
+        clients = {"trading": SimpleNamespace(get_all_positions=lambda: []),
+                   "stock": self._bars(715.0)}
+        out = handlers_mod()._reconcile(clients, positions, self.notifier)
+        self.assertEqual(out["expired"], ["H2E"])
+        self.assertEqual(out["phantom"], [])
+        self.assertNotIn("H2E", storage.POSITIONS.all())
+        self.assertFalse(any("NOT HELD" in m for m in self.sent))
+        self.assertTrue(any("EXPIRED" in m and "+40" in m for m in self.sent))
+        self.assertAlmostEqual(storage.JOURNAL.todays_realized_pnl(), 40.0)
+
+    def test_expiry_books_intrinsic_when_it_finished_in_the_money(self):
+        positions = {"H2E": self._expired_pos()}
+        clients = {"trading": SimpleNamespace(get_all_positions=lambda: []),
+                   "stock": self._bars(698.5)}               # 1.50 ITM
+        handlers_mod()._reconcile(clients, positions, self.notifier)
+        self.assertAlmostEqual(storage.JOURNAL.todays_realized_pnl(), 40.0 - 150.0)
+
+    def test_expiry_with_no_close_says_it_assumed(self):
+        positions = {"H2E": self._expired_pos()}
+        clients = {"trading": SimpleNamespace(get_all_positions=lambda: [])}
+        handlers_mod()._reconcile(clients, positions, self.notifier)
+        self.assertTrue(any("ASSUMED" in m for m in self.sent))
+
+    # -- entry timing / term structure ----------------------------------------
+    def test_session_reads_the_exchange_clock(self):
+        et = timezone(timedelta(hours=-5))                    # EST, after DST ends
+        now = datetime(2026, 11, 27, 12, 40, tzinfo=et)       # day after Thanksgiving
+        clock = SimpleNamespace(is_open=True, timestamp=now,
+                                next_close=datetime(2026, 11, 27, 13, 0, tzinfo=et))
+        s = handlers_mod()._Session(clock)
+        self.assertAlmostEqual(s.minutes_since_open, 190.0)
+        self.assertAlmostEqual(s.minutes_to_close, 20.0, msg="early close, not 16:00")
+        self.assertEqual(s.today, date(2026, 11, 27))
+
+    def test_inverted_term_structure_vetoes(self):
+        self.assertIsNotNone(W.term_structure_veto(-0.01))
+        self.assertIsNone(W.term_structure_veto(0.02))
+        self.assertIsNone(W.term_structure_veto(None), "unmeasurable drops out")
 
 
 def handlers_mod():
