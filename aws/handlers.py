@@ -198,6 +198,20 @@ def _cfg_float(cfg, key, default) -> float:
         return float(default)
 
 
+def _wing_for(cfg, spot) -> float:
+    """Wing width in dollars. `wing_width_pct` (fraction of spot) wins when set.
+
+    One dollar width cannot serve three underlyings: $14 is 2% of SPY or QQQ
+    near $700 and 5% of IWM near $270. structure_study.py measured width as a
+    fraction of spot, so the live path has to as well or it is trading a
+    different structure from the one that was tested.
+    """
+    pct = _cfg_float(cfg or {}, "wing_width_pct", 0)
+    if pct > 0 and spot:
+        return max(1.0, float(round(pct * float(spot))))
+    return _cfg_float(cfg or {}, "wing_width", 5)
+
+
 def _clients(cfg, paper: bool):
     from alpaca.data.historical.corporate_actions import CorporateActionsClient
     from alpaca.data.historical.news import NewsClient
@@ -526,7 +540,7 @@ def _evaluate_cached(symbol, clients, cal, cache, cfg=None):
         return {"error": "no live two-sided market"}
 
     target_dte = int((cfg or {}).get("target_dte", 45))
-    wing_width = float((cfg or {}).get("wing_width", 5))
+    wing_width = _wing_for(cfg, chain.spot)
     short_delta = float((cfg or {}).get("short_delta", 0.30))
     min_dte = int((cfg or {}).get("min_dte", 1))
 
@@ -773,13 +787,16 @@ def _settle_closing(positions, clients, notifier, acted):
                 debit = float(c.get("limit_price") or 0.0) * 100.0
             realized = ((float(p.get("entry_credit_per_contract") or 0.0) - debit)
                         * int(p.get("contracts") or 1))
+            exit_spot = _spot(clients, p.get("underlying"))
             ex._journal({"token": f"FILL-{token}", "status": "submitted",
                          "submitted_at": datetime.now(timezone.utc).isoformat(),
                          "mode": c.get("mode", "paper"),
                          "reason": c.get("reason", ""),
                          "order_id": c.get("order_id"),
                          "fill_price": round(debit / 100.0, 4),
-                         "total_risk": 0.0, "realized_pnl": realized})
+                         "total_risk": 0.0, "realized_pnl": realized,
+                         "spot_at_exit": exit_spot,
+                         "hedged_pnl": _hedged_pnl(p, realized, exit_spot)})
             storage.POSITIONS.delete(token)
             positions.pop(token, None)
             notifier.send(f"[{token}] CLOSED — fill confirmed "
@@ -921,6 +938,26 @@ def _reconcile(clients, positions, notifier, cache=None):
     return {"untracked": stray, "phantom": phantom, "expired": expired}
 
 
+def _hedged_pnl(p, realized, exit_spot):
+    """Realised P&L with the entry delta hedged out, or None if unknowable.
+
+    The forward test is judged on this, not on realised P&L, for the reason
+    structure_study.py gives: raw short-put P&L over a rising tape is beta.
+    Positions opened before entry deltas were recorded return None rather
+    than a number computed from a zero delta.
+    """
+    try:
+        s0 = float(p.get("spot_at_entry") or 0.0)
+        ds, dl = p.get("short_delta"), p.get("long_delta")
+        if not s0 or exit_spot is None or ds is None or dl is None:
+            return None
+        pdelta = -float(ds) + float(dl)          # per share, short put spread
+        n = int(p.get("contracts") or 1)
+        return realized - pdelta * 100.0 * n * (float(exit_spot) - s0)
+    except (TypeError, ValueError):
+        return None
+
+
 def _book_expiry(clients, token, p, notifier):
     """Journal a spread that expired, priced at intrinsic off the expiry close.
 
@@ -957,7 +994,9 @@ def _book_expiry(clients, token, p, notifier):
     ex._journal({"token": f"EXPIRED-{token}", "status": "submitted",
                  "submitted_at": datetime.now(timezone.utc).isoformat(),
                  "mode": p.get("mode", "paper"), "reason": "expired",
-                 "settle": settle, "total_risk": 0.0, "realized_pnl": realized})
+                 "settle": settle, "total_risk": 0.0, "realized_pnl": realized,
+                 "spot_at_exit": settle,
+                 "hedged_pnl": _hedged_pnl(p, realized, settle)})
     try:
         notifier.send(f"[{token}] EXPIRED {p['underlying']} {short_k:.0f}/"
                       f"{long_k:.0f}p{note} P&L ${realized:+.0f}")
@@ -1013,6 +1052,7 @@ def diag(event, context):
                 out[sym] = {"error": "no live two-sided option market"}
                 continue
 
+            wing = _wing_for(cfg, chain.spot)
             chosen = chain.nearest_expiry(target_dte, min_dte)
             rows = []
             for e in chain.expiries():
@@ -1048,7 +1088,9 @@ def diag(event, context):
             out[sym] = {"error": f"{type(e).__name__}: {e}"}
 
     return _ok({"knobs": {"target_dte": target_dte, "min_dte": min_dte,
-                          "wing_width": wing, "short_delta": want_delta,
+                          "wing_width": wing,      # last symbol's; see pct
+                          "wing_width_pct": cfg.get("wing_width_pct"),
+                          "short_delta": want_delta,
                           "min_credit": floor, "max_spread_frac": max_frac},
                 "chains": out})
 

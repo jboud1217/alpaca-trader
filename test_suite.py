@@ -1736,6 +1736,46 @@ class TestHoldToExpiry(unittest.TestCase):
         self.assertIsNone(W.term_structure_veto(None), "unmeasurable drops out")
 
 
+class TestForwardTest(unittest.TestCase):
+    """The 14-DTE / 0.30-delta / 2%-wide forward test, and the hedged scoring
+    it is judged on."""
+
+    def test_wing_pct_scales_with_the_underlying(self):
+        h = handlers_mod()
+        cfg = {"wing_width_pct": "0.02", "wing_width": "3"}
+        self.assertEqual(h._wing_for(cfg, 700.0), 14.0)
+        self.assertEqual(h._wing_for(cfg, 270.0), 5.0)
+        self.assertEqual(h._wing_for({"wing_width": "3"}, 700.0), 3.0,
+                         "no pct set -> the dollar width, unchanged")
+        self.assertEqual(h._wing_for({"wing_width_pct": "0.001"}, 270.0), 1.0)
+
+    def test_sized_trade_records_entry_deltas_and_spot(self):
+        chain = SimpleNamespace(spot=701.5)
+        exp = date.today() + timedelta(days=14)
+        sq = OptionQuote("put", 690.0, exp, 2.60, 2.64, -0.30, 0.18, symbol="S")
+        lq = OptionQuote("put", 676.0, exp, 0.90, 0.93, -0.12, 0.20, symbol="L")
+        t = ex.size_trade("FWD", "SPY", chain, sq, lq,
+                          ex.RiskLimits(account_equity=100_000, risk_per_trade_frac=0.015,
+                                        max_risk_per_trade=1500, max_contracts=1,
+                                        max_open_risk=3500, max_spread_frac_of_credit=0.10,
+                                        min_credit_per_contract=30))
+        self.assertAlmostEqual(t.long_delta, -0.12)
+        self.assertAlmostEqual(t.spot, 701.5)
+        # survives the PENDING round trip respond() does
+        from dataclasses import asdict
+        self.assertEqual(ex.SizedTrade(**asdict(t)).long_delta, -0.12)
+
+    def test_hedged_pnl_takes_the_direction_out(self):
+        h = handlers_mod()
+        p = {"spot_at_entry": 700.0, "short_delta": -0.30, "long_delta": -0.12,
+             "contracts": 1}
+        # +$170 realised on a +$10 rally: 0.18 delta x 100 x 10 = $180 was beta
+        self.assertAlmostEqual(h._hedged_pnl(p, 170.0, 710.0), -10.0)
+        self.assertIsNone(h._hedged_pnl({"contracts": 1}, 170.0, 710.0),
+                          "pre-change positions have no entry delta: None, not a guess")
+        self.assertIsNone(h._hedged_pnl(p, 170.0, None))
+
+
 def handlers_mod():
     import handlers
     return handlers

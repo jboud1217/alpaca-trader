@@ -191,6 +191,14 @@ class SizedTrade:
     half_spread_cost: float
     created_at: str
     sizing_note: str = ""
+    # Entry conditions for scoring the trade DELTA-HEDGED afterwards: P&L minus
+    # (|short delta| - |long delta|) x 100 x the underlying's move to the exit.
+    # A short put spread is long the market, so raw P&L over a rising tape is
+    # mostly beta (structure_study.py: raw > 0 in 44 of 48 cells, hedged in 14).
+    # The forward test is judged hedged, and the chain that knew these numbers
+    # is gone by the time anyone asks.
+    long_delta: float = 0.0
+    spot: float = 0.0
 
     def summary(self) -> str:
         return (f"{self.underlying} {self.short_strike:.0f}/{self.long_strike:.0f}p "
@@ -387,7 +395,9 @@ def size_trade(token: str, underlying: str, chain, short_q, long_q,
         credit_per_contract=credit, max_loss_per_contract=max_loss,
         total_credit=contracts * credit, total_risk=total_risk,
         short_delta=short_q.delta, half_spread_cost=half_spread,
-        created_at=datetime.now(timezone.utc).isoformat(), sizing_note=note)
+        created_at=datetime.now(timezone.utc).isoformat(), sizing_note=note,
+        long_delta=float(long_q.delta or 0.0),
+        spot=float(getattr(chain, "spot", 0.0) or 0.0))
 
 
 # --------------------------------------------------------------------------- #
@@ -668,6 +678,8 @@ class Executor:
                 "max_loss_per_contract": trade.max_loss_per_contract,
                 "opened_at": rec["submitted_at"], "order_id": rec["order_id"],
                 "mode": rec["mode"],
+                "short_delta": trade.short_delta, "long_delta": trade.long_delta,
+                "spot_at_entry": trade.spot,
             })
         except Exception as e:
             # Never fail the order because bookkeeping failed -- but say so
